@@ -4,3 +4,4 @@ pub use ldk_service::{
     LdkChannelInfo, LdkInvoiceResult, LdkPaymentResult, LdkPeerInfo, LdkService, LdkServiceConfig, LdkServiceError,
     LdkServiceInitError,
 };
+pub use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};

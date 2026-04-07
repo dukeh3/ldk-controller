@@ -3,7 +3,9 @@ use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
-use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
+use ldk_node::bitcoin::Address;
+use ldk_node::lightning::offers::offer::Offer;
+use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 use ldk_node::{Builder, Node};
 use serde::Serialize;
 use std::fmt;
@@ -99,6 +101,9 @@ pub enum LdkServiceError {
     ChannelFailed(String),
     PeerFailed(String),
     PaymentFailed(String),
+    PaymentNotFound(String),
+    InvalidAddress(String),
+    OfferFailed(String),
     StopFailed(String),
 }
 
@@ -119,6 +124,9 @@ impl fmt::Display for LdkServiceError {
             Self::ChannelFailed(msg) => write!(f, "channel operation failed: {msg}"),
             Self::PeerFailed(msg) => write!(f, "peer operation failed: {msg}"),
             Self::PaymentFailed(msg) => write!(f, "payment failed: {msg}"),
+            Self::PaymentNotFound(msg) => write!(f, "payment not found: {msg}"),
+            Self::InvalidAddress(msg) => write!(f, "invalid address: {msg}"),
+            Self::OfferFailed(msg) => write!(f, "offer operation failed: {msg}"),
             Self::StopFailed(msg) => write!(f, "ldk node stop failed: {msg}"),
         }
     }
@@ -515,6 +523,131 @@ impl LdkService {
             .collect()
     }
 
+    pub fn lookup_payment_by_hash(&self, payment_hash: &str) -> Result<PaymentDetails, LdkServiceError> {
+        let hash_bytes = decode_hex(payment_hash)
+            .map_err(|e| LdkServiceError::PaymentNotFound(format!("invalid payment hash hex: {e}")))?;
+        let arr: [u8; 32] = hash_bytes
+            .try_into()
+            .map_err(|_| LdkServiceError::PaymentNotFound("payment hash must be 32 bytes".to_string()))?;
+        let payment_id = PaymentId(arr);
+        self.node
+            .payment(&payment_id)
+            .ok_or_else(|| LdkServiceError::PaymentNotFound(payment_hash.to_string()))
+    }
+
+    pub fn lookup_payment_by_bolt11(&self, invoice_str: &str) -> Result<PaymentDetails, LdkServiceError> {
+        let invoice = Bolt11Invoice::from_str(invoice_str)
+            .map_err(|e| LdkServiceError::InvalidInvoice(e.to_string()))?;
+        let hash = invoice.payment_hash().to_string();
+        self.lookup_payment_by_hash(&hash)
+    }
+
+    pub fn list_payments_filtered(
+        &self,
+        from: Option<u64>,
+        until: Option<u64>,
+        limit: Option<u64>,
+        offset: Option<u64>,
+        unpaid: Option<bool>,
+        direction: Option<PaymentDirection>,
+    ) -> Vec<PaymentDetails> {
+        let mut payments: Vec<PaymentDetails> = self
+            .node
+            .list_payments()
+            .into_iter()
+            .filter(|p| {
+                if let Some(from_ts) = from {
+                    if p.latest_update_timestamp < from_ts {
+                        return false;
+                    }
+                }
+                if let Some(until_ts) = until {
+                    if p.latest_update_timestamp > until_ts {
+                        return false;
+                    }
+                }
+                if let Some(dir) = &direction {
+                    if p.direction != *dir {
+                        return false;
+                    }
+                }
+                let include_unpaid = unpaid.unwrap_or(false);
+                if !include_unpaid && p.status == PaymentStatus::Pending {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        payments.sort_by(|a, b| b.latest_update_timestamp.cmp(&a.latest_update_timestamp));
+
+        let offset_val = offset.unwrap_or(0) as usize;
+        let payments = if offset_val > 0 {
+            payments.into_iter().skip(offset_val).collect()
+        } else {
+            payments
+        };
+
+        if let Some(lim) = limit {
+            payments.into_iter().take(lim as usize).collect()
+        } else {
+            payments
+        }
+    }
+
+    pub fn pay_onchain(
+        &self,
+        address: &str,
+        amount_sats: u64,
+        _feerate: Option<u64>,
+    ) -> Result<String, LdkServiceError> {
+        let addr = Address::from_str(address)
+            .map_err(|e| LdkServiceError::InvalidAddress(e.to_string()))?
+            .require_network(self.network)
+            .map_err(|e| LdkServiceError::InvalidAddress(e.to_string()))?;
+
+        let txid = self
+            .node
+            .onchain_payment()
+            .send_to_address(&addr, amount_sats, None)
+            .map_err(|e| LdkServiceError::PaymentFailed(e.to_string()))?;
+
+        Ok(txid.to_string())
+    }
+
+    pub fn make_offer(
+        &self,
+        amount_msat: u64,
+        description: &str,
+        expiry_secs: Option<u32>,
+    ) -> Result<String, LdkServiceError> {
+        let offer = self
+            .node
+            .bolt12_payment()
+            .receive(amount_msat, description, expiry_secs, None)
+            .map_err(|e| LdkServiceError::OfferFailed(e.to_string()))?;
+
+        Ok(offer.to_string())
+    }
+
+    pub fn pay_offer(
+        &self,
+        offer_str: &str,
+        _amount: Option<u64>,
+        payer_note: Option<String>,
+    ) -> Result<LdkPaymentResult, LdkServiceError> {
+        let offer = Offer::from_str(offer_str)
+            .map_err(|e| LdkServiceError::OfferFailed(format!("invalid offer: {e:?}")))?;
+
+        let payment_id = self
+            .node
+            .bolt12_payment()
+            .send(&offer, None, payer_note, None)
+            .map_err(|e| LdkServiceError::PaymentFailed(e.to_string()))?;
+
+        self.wait_for_outbound_payment(payment_id)
+    }
+
     fn wait_for_outbound_payment(
         &self,
         payment_id: PaymentId,
@@ -573,4 +706,14 @@ fn hex_string(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{:02x}", b);
     }
     out
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err("odd-length hex string".to_string());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
 }

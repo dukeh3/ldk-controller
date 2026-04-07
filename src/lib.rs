@@ -6,21 +6,24 @@ use serde_json::{json, Value};
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
     CancelHoldInvoiceResponse, ErrorCode, GetBalanceResponse, GetInfoResponse,
-    LookupInvoiceResponse, MakeHoldInvoiceResponse, MakeInvoiceResponse, Method, NIP47Error,
-    PayInvoiceResponse, PayKeysendResponse, Request, RequestParams, Response, ResponseResult,
+    LookupInvoiceResponse, MakeHoldInvoiceResponse, MakeInvoiceResponse, MakeNewAddressResponse,
+    MakeOfferResponse, Method, NIP47Error, PayInvoiceResponse, PayKeysendResponse,
+    PayOfferResponse, PayOnchainResponse, Request, RequestParams, Response, ResponseResult,
     SettleHoldInvoiceResponse, TransactionState, TransactionType,
+    LookupOfferResponse, LookupAddressResponse, AddressTransaction,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::lightning::{LdkService, LdkServiceError};
+use crate::lightning::{LdkService, LdkServiceError, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 pub mod rate_limit_rule;
 pub mod lightning;
 mod state;
 pub mod usage_profile;
 
 use crate::state::store::access_store::SharedRateState;
+use crate::state::{offer_store, address_store};
 pub use rate_limit_rule::RateLimitRule;
 pub use state::rate_state::RateStateError;
 pub use usage_profile::get_usage_profile;
@@ -472,6 +475,8 @@ fn request_spend_msat(request: &Request) -> Option<u64> {
     match &request.params {
         RequestParams::PayInvoice(params) => params.amount,
         RequestParams::PayKeysend(params) => Some(params.amount),
+        RequestParams::PayOnchain(params) => Some(params.amount.saturating_mul(1000)),
+        RequestParams::PayOffer(params) => params.amount,
         _ => None,
     }
 }
@@ -548,6 +553,12 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::MakeHoldInvoice,
     Method::CancelHoldInvoice,
     Method::SettleHoldInvoice,
+    Method::PayOnchain,
+    Method::MakeNewAddress,
+    Method::PayOffer,
+    Method::MakeOffer,
+    Method::LookupOffer,
+    Method::LookupAddress,
 ];
 
 pub const CONTROL_INFO_KIND: u16 = 13198;
@@ -748,6 +759,75 @@ pub async fn run_nwc_service_with_ldk(
 ) -> Result<Client> {
     set_ldk_service(ldk_service);
     run_nwc_service(keys, relay_url).await
+}
+
+fn payment_hash_from_kind(kind: &PaymentKind) -> Option<String> {
+    match kind {
+        PaymentKind::Bolt11 { hash, .. } => Some(hex_payment_hash(&hash.0)),
+        PaymentKind::Bolt11Jit { hash, .. } => Some(hex_payment_hash(&hash.0)),
+        PaymentKind::Spontaneous { hash, .. } => Some(hex_payment_hash(&hash.0)),
+        PaymentKind::Bolt12Offer { hash, .. } => hash.as_ref().map(|h| hex_payment_hash(&h.0)),
+        PaymentKind::Bolt12Refund { hash, .. } => hash.as_ref().map(|h| hex_payment_hash(&h.0)),
+        _ => None,
+    }
+}
+
+fn preimage_from_kind(kind: &PaymentKind) -> Option<String> {
+    match kind {
+        PaymentKind::Bolt11 { preimage, .. } => preimage.as_ref().map(|p| hex_payment_hash(&p.0)),
+        PaymentKind::Bolt11Jit { preimage, .. } => preimage.as_ref().map(|p| hex_payment_hash(&p.0)),
+        PaymentKind::Spontaneous { preimage, .. } => preimage.as_ref().map(|p| hex_payment_hash(&p.0)),
+        PaymentKind::Bolt12Offer { preimage, .. } => preimage.as_ref().map(|p| hex_payment_hash(&p.0)),
+        PaymentKind::Bolt12Refund { preimage, .. } => preimage.as_ref().map(|p| hex_payment_hash(&p.0)),
+        _ => None,
+    }
+}
+
+fn hex_payment_hash(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{:02x}", b);
+    }
+    out
+}
+
+fn payment_details_to_lookup_invoice_response(payment: &PaymentDetails) -> LookupInvoiceResponse {
+    let transaction_type = match payment.direction {
+        PaymentDirection::Inbound => Some(TransactionType::Incoming),
+        PaymentDirection::Outbound => Some(TransactionType::Outgoing),
+    };
+
+    let state = match payment.status {
+        PaymentStatus::Pending => Some(TransactionState::Pending),
+        PaymentStatus::Succeeded => Some(TransactionState::Settled),
+        PaymentStatus::Failed => Some(TransactionState::Failed),
+    };
+
+    let payment_hash = payment_hash_from_kind(&payment.kind).unwrap_or_default();
+    let preimage = preimage_from_kind(&payment.kind);
+
+    let settled_at = if payment.status == PaymentStatus::Succeeded {
+        Some(Timestamp::from(payment.latest_update_timestamp))
+    } else {
+        None
+    };
+
+    LookupInvoiceResponse {
+        transaction_type,
+        state,
+        invoice: None,
+        description: None,
+        description_hash: None,
+        preimage,
+        payment_hash,
+        amount: payment.amount_msat.unwrap_or(0),
+        fees_paid: payment.fee_paid_msat.unwrap_or(0),
+        created_at: Timestamp::from(payment.latest_update_timestamp),
+        expires_at: None,
+        settled_at,
+        metadata: None,
+    }
 }
 
 trait Handler: Send + Sync {
@@ -1032,7 +1112,43 @@ impl Handler for LookupInvoiceHandler {
         })
     }
 
-    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let Some(ldk_service) = get_ldk_service() {
+            if let RequestParams::LookupInvoice(params) = &req.params {
+                let payment = if let Some(invoice) = &params.invoice {
+                    ldk_service.lookup_payment_by_bolt11(invoice)
+                } else if let Some(hash) = &params.payment_hash {
+                    ldk_service.lookup_payment_by_hash(hash)
+                } else {
+                    return Err(NIP47Error {
+                        code: ErrorCode::Other,
+                        message: "payment_hash or invoice is required".to_string(),
+                    });
+                };
+
+                match payment {
+                    Ok(details) => {
+                        let response = payment_details_to_lookup_invoice_response(&details);
+                        return Ok(Response {
+                            result_type: Method::LookupInvoice,
+                            error: None,
+                            result: Some(ResponseResult::LookupInvoice(response)),
+                        });
+                    }
+                    Err(LdkServiceError::PaymentNotFound(msg)) => {
+                        return Err(NIP47Error {
+                            code: ErrorCode::NotFound,
+                            message: format!("payment not found: {msg}"),
+                        });
+                    }
+                    Err(e) => {
+                        return Err(map_ldk_service_error("lookup_invoice", ErrorCode::Other, e));
+                    }
+                }
+            }
+        }
+
+        // Fallback stub when no LDK service is available
         Ok(Response {
             result_type: Method::LookupInvoice,
             error: None,
@@ -1069,7 +1185,37 @@ impl Handler for ListTransactionsHandler {
         })
     }
 
-    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let Some(ldk_service) = get_ldk_service() {
+            if let RequestParams::ListTransactions(params) = &req.params {
+                let direction = params.transaction_type.map(|tt| match tt {
+                    TransactionType::Incoming => PaymentDirection::Inbound,
+                    TransactionType::Outgoing => PaymentDirection::Outbound,
+                });
+
+                let payments = ldk_service.list_payments_filtered(
+                    params.from.map(|t| t.as_secs()),
+                    params.until.map(|t| t.as_secs()),
+                    params.limit,
+                    params.offset,
+                    params.unpaid,
+                    direction,
+                );
+
+                let transactions: Vec<LookupInvoiceResponse> = payments
+                    .iter()
+                    .map(payment_details_to_lookup_invoice_response)
+                    .collect();
+
+                return Ok(Response {
+                    result_type: Method::ListTransactions,
+                    error: None,
+                    result: Some(ResponseResult::ListTransactions(transactions)),
+                });
+            }
+        }
+
+        // Fallback stub when no LDK service is available
         Ok(Response {
             result_type: Method::ListTransactions,
             error: None,
@@ -1185,6 +1331,304 @@ impl Handler for SettleHoldInvoiceHandler {
     }
 }
 
+struct MakeNewAddressHandler;
+
+impl Handler for MakeNewAddressHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if req.params != RequestParams::MakeNewAddress {
+            return Err(NIP47Error {
+                code: ErrorCode::Other,
+                message: "invalid params for make_new_address".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let ldk_service = get_ldk_service().ok_or_else(|| NIP47Error {
+            code: ErrorCode::Other,
+            message: "ldk service unavailable".to_string(),
+        })?;
+
+        let address = ldk_service
+            .new_onchain_address()
+            .map_err(|e| map_ldk_service_error("make_new_address", ErrorCode::Other, e))?;
+
+        // Track the address in the address store
+        address_store::register_address(address.clone());
+
+        Ok(Response {
+            result_type: Method::MakeNewAddress,
+            error: None,
+            result: Some(ResponseResult::MakeNewAddress(MakeNewAddressResponse {
+                address,
+            })),
+        })
+    }
+}
+
+struct PayOnchainHandler;
+
+impl Handler for PayOnchainHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::PayOnchain(params) = &req.params {
+            if params.address.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "address is required".to_string(),
+                });
+            }
+            if params.amount == 0 {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "amount must be greater than 0".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for pay_onchain".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let ldk_service = get_ldk_service().ok_or_else(|| NIP47Error {
+            code: ErrorCode::Other,
+            message: "ldk service unavailable".to_string(),
+        })?;
+
+        if let RequestParams::PayOnchain(params) = &req.params {
+            let txid = ldk_service
+                .pay_onchain(&params.address, params.amount, params.feerate)
+                .map_err(|e| map_ldk_service_error("pay_onchain", ErrorCode::PaymentFailed, e))?;
+
+            return Ok(Response {
+                result_type: Method::PayOnchain,
+                error: None,
+                result: Some(ResponseResult::PayOnchain(PayOnchainResponse { txid })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for pay_onchain".to_string(),
+        })
+    }
+}
+
+struct MakeOfferHandler;
+
+impl Handler for MakeOfferHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::MakeOffer(params) = &req.params {
+            if params.amount == 0 {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "amount must be greater than 0".to_string(),
+                });
+            }
+            if params.description.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "description is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for make_offer".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let ldk_service = get_ldk_service().ok_or_else(|| NIP47Error {
+            code: ErrorCode::Other,
+            message: "ldk service unavailable".to_string(),
+        })?;
+
+        if let RequestParams::MakeOffer(params) = &req.params {
+            let offer_str = ldk_service
+                .make_offer(params.amount, &params.description, params.expiry)
+                .map_err(|e| map_ldk_service_error("make_offer", ErrorCode::Other, e))?;
+
+            // Track the offer in the offer store
+            offer_store::insert_offer(offer_str.clone(), params.description.clone(), params.amount);
+
+            return Ok(Response {
+                result_type: Method::MakeOffer,
+                error: None,
+                result: Some(ResponseResult::MakeOffer(MakeOfferResponse {
+                    offer: offer_str,
+                    description: Some(params.description.clone()),
+                    amount: Some(params.amount),
+                })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for make_offer".to_string(),
+        })
+    }
+}
+
+struct PayOfferHandler;
+
+impl Handler for PayOfferHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::PayOffer(params) = &req.params {
+            if params.offer.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "offer is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for pay_offer".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let ldk_service = get_ldk_service().ok_or_else(|| NIP47Error {
+            code: ErrorCode::Other,
+            message: "ldk service unavailable".to_string(),
+        })?;
+
+        if let RequestParams::PayOffer(params) = &req.params {
+            let payment = ldk_service
+                .pay_offer(&params.offer, params.amount, params.payer_note.clone())
+                .map_err(|e| map_ldk_service_error("pay_offer", ErrorCode::PaymentFailed, e))?;
+
+            return Ok(Response {
+                result_type: Method::PayOffer,
+                error: None,
+                result: Some(ResponseResult::PayOffer(PayOfferResponse {
+                    preimage: Some(payment.preimage),
+                    fees_paid: payment.fees_paid_msat,
+                })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for pay_offer".to_string(),
+        })
+    }
+}
+
+struct LookupOfferHandler;
+
+impl Handler for LookupOfferHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::LookupOffer(params) = &req.params {
+            if params.offer.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "offer is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for lookup_offer".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let RequestParams::LookupOffer(params) = &req.params {
+            let record = offer_store::get_offer(&params.offer).ok_or_else(|| NIP47Error {
+                code: ErrorCode::NotFound,
+                message: format!("offer not found: {}", params.offer),
+            })?;
+
+            return Ok(Response {
+                result_type: Method::LookupOffer,
+                error: None,
+                result: Some(ResponseResult::LookupOffer(LookupOfferResponse {
+                    offer: record.offer,
+                    description: Some(record.description),
+                    amount: Some(record.amount_msat),
+                    active: record.active,
+                    num_payments_received: record.num_payments_received,
+                    total_received: record.total_received_msat,
+                })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for lookup_offer".to_string(),
+        })
+    }
+}
+
+struct LookupAddressHandler;
+
+impl Handler for LookupAddressHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::LookupAddress(params) = &req.params {
+            if params.address.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "address is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for lookup_address".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let RequestParams::LookupAddress(params) = &req.params {
+            let record = address_store::get_address(&params.address).ok_or_else(|| NIP47Error {
+                code: ErrorCode::NotFound,
+                message: format!("address not found: {}", params.address),
+            })?;
+
+            let transactions: Vec<AddressTransaction> = record
+                .transactions
+                .iter()
+                .map(|tx| AddressTransaction {
+                    txid: tx.txid.clone(),
+                    amount: tx.amount_sats,
+                    timestamp: Timestamp::from(tx.timestamp),
+                })
+                .collect();
+
+            let total_received: u64 = record.transactions.iter().map(|tx| tx.amount_sats).sum();
+
+            return Ok(Response {
+                result_type: Method::LookupAddress,
+                error: None,
+                result: Some(ResponseResult::LookupAddress(LookupAddressResponse {
+                    address: record.address,
+                    total_received,
+                    transactions,
+                })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for lookup_address".to_string(),
+        })
+    }
+}
+
 // Lazily initialize a static handler map to avoid rebuilding it per request.
 fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
     static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
@@ -1207,6 +1651,12 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
             Method::SettleHoldInvoice,
             Box::new(SettleHoldInvoiceHandler),
         );
+        handlers.insert(Method::MakeNewAddress, Box::new(MakeNewAddressHandler));
+        handlers.insert(Method::PayOnchain, Box::new(PayOnchainHandler));
+        handlers.insert(Method::MakeOffer, Box::new(MakeOfferHandler));
+        handlers.insert(Method::PayOffer, Box::new(PayOfferHandler));
+        handlers.insert(Method::LookupOffer, Box::new(LookupOfferHandler));
+        handlers.insert(Method::LookupAddress, Box::new(LookupAddressHandler));
         handlers
     })
 }
