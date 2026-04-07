@@ -27,7 +27,7 @@ mod state;
 pub mod usage_profile;
 
 use crate::state::store::access_store::SharedRateState;
-use crate::state::{offer_store, address_store, subscription_store};
+use crate::state::{offer_store, address_store, subscription_store, forwarding_store};
 pub use rate_limit_rule::RateLimitRule;
 pub use state::rate_state::RateStateError;
 pub use usage_profile::get_usage_profile;
@@ -580,6 +580,16 @@ const SUPPORTED_CONTROL_METHODS: &[&str] = &[
     "list_peers",
     "disconnect_peer",
     "subscribe_notifications",
+    "get_channel_fees",
+    "set_channel_fees",
+    "list_network_nodes",
+    "get_network_node",
+    "get_network_stats",
+    "get_network_channel",
+    "get_forwarding_history",
+    "get_pending_htlcs",
+    "estimate_route_fee",
+    "query_routes",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2172,6 +2182,300 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
     }
 
+    if request.method == "get_channel_fees" {
+        #[derive(Deserialize)]
+        struct GetChannelFeesParams {
+            #[serde(default)]
+            id: Option<String>,
+        }
+        let params = match serde_json::from_value::<GetChannelFeesParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid get_channel_fees params: {e}"),
+                    )),
+                };
+            }
+        };
+        let fees = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.get_channel_fees(params.id.as_deref())
+        } else {
+            Vec::new()
+        };
+        return ControlResponse {
+            result_type: "get_channel_fees".to_string(),
+            result: Some(json!({ "fees": fees })),
+            error: None,
+        };
+    }
+
+    if request.method == "set_channel_fees" {
+        #[derive(Deserialize)]
+        struct SetChannelFeesParams {
+            id: String,
+            #[serde(default)]
+            base_fee_msat: Option<u32>,
+            #[serde(default)]
+            fee_rate: Option<u32>,
+        }
+        let params = match serde_json::from_value::<SetChannelFeesParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid set_channel_fees params: {e}"),
+                    )),
+                };
+            }
+        };
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "set_channel_fees".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "ldk service unavailable".to_string(),
+                )),
+            };
+        };
+        if let Err(e) = ldk_service.set_channel_fees(
+            &params.id,
+            params.base_fee_msat,
+            params.fee_rate,
+        ) {
+            return ControlResponse {
+                result_type: "set_channel_fees".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    format!("set_channel_fees failed: {e}"),
+                )),
+            };
+        }
+        return ControlResponse {
+            result_type: "set_channel_fees".to_string(),
+            result: Some(json!({})),
+            error: None,
+        };
+    }
+
+    if request.method == "list_network_nodes" {
+        #[derive(Deserialize)]
+        struct ListNetworkNodesParams {
+            #[serde(default = "default_limit")]
+            limit: usize,
+            #[serde(default)]
+            offset: usize,
+        }
+        fn default_limit() -> usize { 100 }
+        let params = match serde_json::from_value::<ListNetworkNodesParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid list_network_nodes params: {e}"),
+                    )),
+                };
+            }
+        };
+        let nodes = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.list_network_nodes(params.limit, params.offset)
+        } else {
+            Vec::new()
+        };
+        return ControlResponse {
+            result_type: "list_network_nodes".to_string(),
+            result: Some(json!({ "nodes": nodes })),
+            error: None,
+        };
+    }
+
+    if request.method == "get_network_node" {
+        #[derive(Deserialize)]
+        struct GetNetworkNodeParams {
+            pubkey: String,
+        }
+        let params = match serde_json::from_value::<GetNetworkNodeParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid get_network_node params: {e}"),
+                    )),
+                };
+            }
+        };
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "get_network_node".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "ldk service unavailable".to_string(),
+                )),
+            };
+        };
+        match ldk_service.get_network_node(&params.pubkey) {
+            Ok(Some(node)) => {
+                return ControlResponse {
+                    result_type: "get_network_node".to_string(),
+                    result: Some(serde_json::to_value(node).unwrap()),
+                    error: None,
+                };
+            }
+            Ok(None) => {
+                return ControlResponse {
+                    result_type: "get_network_node".to_string(),
+                    result: None,
+                    error: Some(control_error(
+                        "NOT_FOUND",
+                        format!("node not found: {}", params.pubkey),
+                    )),
+                };
+            }
+            Err(e) => {
+                return ControlResponse {
+                    result_type: "get_network_node".to_string(),
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("get_network_node failed: {e}"),
+                    )),
+                };
+            }
+        }
+    }
+
+    if request.method == "get_network_stats" {
+        let stats = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.get_network_stats()
+        } else {
+            crate::lightning::NetworkStats {
+                num_nodes: 0,
+                num_channels: 0,
+                total_capacity: 0,
+                avg_channel_size: 0,
+                max_channel_size: 0,
+            }
+        };
+        return ControlResponse {
+            result_type: "get_network_stats".to_string(),
+            result: Some(serde_json::to_value(stats).unwrap()),
+            error: None,
+        };
+    }
+
+    if request.method == "get_network_channel" {
+        #[derive(Deserialize)]
+        struct GetNetworkChannelParams {
+            short_channel_id: String,
+        }
+        let params = match serde_json::from_value::<GetNetworkChannelParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid get_network_channel params: {e}"),
+                    )),
+                };
+            }
+        };
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "get_network_channel".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "ldk service unavailable".to_string(),
+                )),
+            };
+        };
+        match ldk_service.get_network_channel(&params.short_channel_id) {
+            Ok(Some(channel)) => {
+                return ControlResponse {
+                    result_type: "get_network_channel".to_string(),
+                    result: Some(serde_json::to_value(channel).unwrap()),
+                    error: None,
+                };
+            }
+            Ok(None) => {
+                return ControlResponse {
+                    result_type: "get_network_channel".to_string(),
+                    result: None,
+                    error: Some(control_error(
+                        "NOT_FOUND",
+                        format!("channel not found: {}", params.short_channel_id),
+                    )),
+                };
+            }
+            Err(e) => {
+                return ControlResponse {
+                    result_type: "get_network_channel".to_string(),
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("get_network_channel failed: {e}"),
+                    )),
+                };
+            }
+        }
+    }
+
+    if request.method == "get_forwarding_history" {
+        #[derive(Deserialize)]
+        struct GetForwardingHistoryParams {
+            #[serde(default)]
+            from: Option<u64>,
+            #[serde(default)]
+            until: Option<u64>,
+            #[serde(default = "default_fwd_limit")]
+            limit: usize,
+            #[serde(default)]
+            offset: usize,
+        }
+        fn default_fwd_limit() -> usize { 100 }
+        let params = match serde_json::from_value::<GetForwardingHistoryParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid get_forwarding_history params: {e}"),
+                    )),
+                };
+            }
+        };
+        let forwards = forwarding_store::get_history(
+            params.from,
+            params.until,
+            params.limit,
+            params.offset,
+        );
+        return ControlResponse {
+            result_type: "get_forwarding_history".to_string(),
+            result: Some(json!({ "forwards": forwards })),
+            error: None,
+        };
+    }
+
     if request.method == "subscribe_notifications" {
         #[derive(Deserialize)]
         struct SubscribeParams {
@@ -2412,6 +2716,29 @@ async fn handle_ldk_event(
             );
             let json = notif.as_json();
             publish_nnc_notification(client, keys, "channel_closed", &json).await?;
+        }
+        Event::PaymentForwarded {
+            prev_channel_id,
+            next_channel_id,
+            total_fee_earned_msat,
+            outbound_amount_forwarded_msat,
+            ..
+        } => {
+            let fee = total_fee_earned_msat.unwrap_or(0);
+            let outgoing = outbound_amount_forwarded_msat.unwrap_or(0);
+            let incoming = outgoing.saturating_add(fee);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            forwarding_store::record_forward(forwarding_store::ForwardingEntry {
+                incoming_channel_id: prev_channel_id.to_string(),
+                outgoing_channel_id: next_channel_id.to_string(),
+                incoming_amount: incoming,
+                outgoing_amount: outgoing,
+                fee_earned: fee,
+                settled_at: now,
+            });
         }
         _ => {} // Ignore other events for now
     }
