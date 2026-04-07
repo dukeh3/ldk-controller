@@ -1836,7 +1836,7 @@ checksum = "f0efe882e02d206d8d279c20eb40e03baf7cb5136a1476dc084a324fbc3ec42d"
 [[package]]
 name = "nostr"
 version = "0.44.1"
-source = "git+https://github.com/dukeh3/nostr.git?rev=4aa0894f#4aa0894fc337580515341628b6400864526ef7e0"
+source = "git+https://github.com/dukeh3/nostr.git?rev=20dc85b1#20dc85b1c11ea3c1e3a5af71f2526fd6bc84193f"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -1861,7 +1861,7 @@ dependencies = [
 [[package]]
 name = "nostr-database"
 version = "0.44.0"
-source = "git+https://github.com/dukeh3/nostr.git?rev=4aa0894f#4aa0894fc337580515341628b6400864526ef7e0"
+source = "git+https://github.com/dukeh3/nostr.git?rev=20dc85b1#20dc85b1c11ea3c1e3a5af71f2526fd6bc84193f"
 dependencies = [
  "btreecap",
  "lru",
@@ -1872,7 +1872,7 @@ dependencies = [
 [[package]]
 name = "nostr-gossip"
 version = "0.44.0"
-source = "git+https://github.com/dukeh3/nostr.git?rev=4aa0894f#4aa0894fc337580515341628b6400864526ef7e0"
+source = "git+https://github.com/dukeh3/nostr.git?rev=20dc85b1#20dc85b1c11ea3c1e3a5af71f2526fd6bc84193f"
 dependencies = [
  "nostr",
 ]
@@ -1880,7 +1880,7 @@ dependencies = [
 [[package]]
 name = "nostr-sdk"
 version = "0.44.1"
-source = "git+https://github.com/dukeh3/nostr.git?rev=4aa0894f#4aa0894fc337580515341628b6400864526ef7e0"
+source = "git+https://github.com/dukeh3/nostr.git?rev=20dc85b1#20dc85b1c11ea3c1e3a5af71f2526fd6bc84193f"
 dependencies = [
  "async-utility",
  "async-wsocket",
@@ -1978,7 +1978,7 @@ dependencies = [
 [[package]]
 name = "nwc"
 version = "0.44.0"
-source = "git+https://github.com/dukeh3/nostr.git?rev=4aa0894f#4aa0894fc337580515341628b6400864526ef7e0"
+source = "git+https://github.com/dukeh3/nostr.git?rev=20dc85b1#20dc85b1c11ea3c1e3a5af71f2526fd6bc84193f"
 dependencies = [
  "nostr",
  "nostr-sdk",

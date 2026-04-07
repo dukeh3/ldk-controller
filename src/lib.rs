@@ -4,6 +4,7 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use nwc::nostr::nips::nip04;
+use nwc::nostr::nips::nip44;
 use nwc::nostr::nips::nip47::{
     CancelHoldInvoiceResponse, ErrorCode, GetBalanceResponse, GetInfoResponse,
     LookupInvoiceResponse, MakeHoldInvoiceResponse, MakeInvoiceResponse, MakeNewAddressResponse,
@@ -659,12 +660,16 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
         .map(|m| m.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    let info_event = EventBuilder::new(Kind::WalletConnectInfo, methods_str);
+    let info_event = EventBuilder::new(Kind::WalletConnectInfo, methods_str)
+        .tag(Tag::parse(["encryption", "nip44_v2 nip04"]).unwrap())
+        .tag(Tag::parse(["notifications", "payment_received payment_sent hold_invoice_accepted"]).unwrap());
     client.send_event_builder(info_event).await?;
 
     // Publish NNC capabilities (Kind 13198) — space-separated list of supported control methods
     let control_methods_str: String = SUPPORTED_CONTROL_METHODS.join(" ");
-    let nnc_info_event = EventBuilder::new(Kind::Custom(CONTROL_INFO_KIND), control_methods_str);
+    let nnc_info_event = EventBuilder::new(Kind::Custom(CONTROL_INFO_KIND), control_methods_str)
+        .tag(Tag::parse(["encryption", "nip44_v2 nip04"]).unwrap())
+        .tag(Tag::parse(["notifications", "channel_opened channel_closed"]).unwrap());
     client.send_event_builder(nnc_info_event).await?;
 
     let our_pubkey = keys.public_key();
@@ -1808,28 +1813,95 @@ fn allowed_methods_for(caller_pubkey: &str) -> Vec<Method> {
     }
 }
 
+// ── NIP-44 encryption helpers ────────────────────────────────────────────────
+
+/// Extract the encryption scheme from an event's `["encryption", ...]` tag.
+/// Returns `"nip04"` when no encryption tag is present (backward compat).
+fn get_encryption_scheme(event: &Event) -> &str {
+    event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        if parts.first().map(|v| v.as_str()) == Some("encryption") {
+            parts.get(1).map(|v| v.as_str())
+        } else {
+            None
+        }
+    }).unwrap_or("nip04")
+}
+
+fn decrypt_content(
+    secret_key: &SecretKey,
+    pubkey: &PublicKey,
+    content: &str,
+    scheme: &str,
+) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    match scheme {
+        "nip44_v2" => Ok(nip44::decrypt(secret_key, pubkey, content)?),
+        "nip04" => Ok(nip04::decrypt(secret_key, pubkey, content)?),
+        other => Err(format!("unsupported encryption: {other}").into()),
+    }
+}
+
+fn encrypt_content(
+    secret_key: &SecretKey,
+    pubkey: &PublicKey,
+    content: &str,
+    scheme: &str,
+) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    match scheme {
+        "nip44_v2" => Ok(nip44::encrypt(secret_key, pubkey, content, nip44::Version::V2)?),
+        "nip04" => Ok(nip04::encrypt(secret_key, pubkey, content)?),
+        other => Err(format!("unsupported encryption: {other}").into()),
+    }
+}
+
 async fn handle_nwc_request(
     client: &Client,
     keys: &Keys,
     event: &Event,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sender_pubkey = event.pubkey;
+    let scheme = get_encryption_scheme(event);
 
-    // Decrypt the NIP-04 encrypted request content
-    let decrypted = nip04::decrypt(keys.secret_key(), &sender_pubkey, &event.content)?;
+    // Return UNSUPPORTED_ENCRYPTION for unknown schemes
+    if scheme != "nip04" && scheme != "nip44_v2" {
+        let error_response = Response {
+            result_type: Method::GetInfo,
+            error: Some(NIP47Error {
+                code: ErrorCode::UnsupportedEncryption,
+                message: format!("unsupported encryption: {scheme}"),
+            }),
+            result: None,
+        };
+        // Fall back to NIP-04 for the error response since we can't use the unknown scheme
+        let encrypted = nip04::encrypt(
+            keys.secret_key(),
+            &sender_pubkey,
+            error_response.as_json(),
+        )?;
+        let response_event = EventBuilder::new(Kind::WalletConnectResponse, encrypted)
+            .tag(Tag::public_key(sender_pubkey))
+            .tag(Tag::event(event.id));
+        client.send_event_builder(response_event).await?;
+        return Ok(());
+    }
+
+    let decrypted = decrypt_content(keys.secret_key(), &sender_pubkey, &event.content, scheme)?;
 
     let request = Request::from_json(&decrypted)?;
 
     let response = process_nwc_request(request, event).await;
 
-    // Encrypt the response for the sender
+    // Encrypt the response using the same scheme the client used
     let response_json = response.as_json();
-    let encrypted = nip04::encrypt(keys.secret_key(), &sender_pubkey, response_json)?;
+    let encrypted = encrypt_content(keys.secret_key(), &sender_pubkey, &response_json, scheme)?;
 
     // Build and send the response event (Kind 23195)
-    let response_event = EventBuilder::new(Kind::WalletConnectResponse, encrypted)
+    let mut response_event = EventBuilder::new(Kind::WalletConnectResponse, encrypted)
         .tag(Tag::public_key(sender_pubkey))
         .tag(Tag::event(event.id));
+    if scheme != "nip04" {
+        response_event = response_event.tag(Tag::parse(["encryption", scheme]).unwrap());
+    }
 
     client.send_event_builder(response_event).await?;
 
@@ -2206,7 +2278,31 @@ async fn handle_control_request(
     event: &Event,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sender_pubkey = event.pubkey;
-    let decrypted = nip04::decrypt(keys.secret_key(), &sender_pubkey, &event.content)?;
+    let scheme = get_encryption_scheme(event);
+
+    // Return UNSUPPORTED_ENCRYPTION for unknown schemes
+    if scheme != "nip04" && scheme != "nip44_v2" {
+        let error_resp = ControlResponse {
+            result_type: "unknown".to_string(),
+            result: None,
+            error: Some(control_error(
+                "UNSUPPORTED_ENCRYPTION",
+                format!("unsupported encryption: {scheme}"),
+            )),
+        };
+        let encrypted = nip04::encrypt(
+            keys.secret_key(),
+            &sender_pubkey,
+            serde_json::to_string(&error_resp)?,
+        )?;
+        let response_event = EventBuilder::new(Kind::Custom(CONTROL_RESPONSE_KIND), encrypted)
+            .tag(Tag::public_key(sender_pubkey))
+            .tag(Tag::event(event.id));
+        client.send_event_builder(response_event).await?;
+        return Ok(());
+    }
+
+    let decrypted = decrypt_content(keys.secret_key(), &sender_pubkey, &event.content, scheme)?;
 
     let response = match serde_json::from_str::<ControlRequest>(&decrypted) {
         Ok(request) => process_control_request(request, &sender_pubkey.to_string()),
@@ -2221,18 +2317,23 @@ async fn handle_control_request(
     };
 
     let response_json = serde_json::to_string(&response)?;
-    let encrypted = nip04::encrypt(keys.secret_key(), &sender_pubkey, response_json)?;
-    let response_event = EventBuilder::new(Kind::Custom(CONTROL_RESPONSE_KIND), encrypted)
+    let encrypted = encrypt_content(keys.secret_key(), &sender_pubkey, &response_json, scheme)?;
+    let mut response_event = EventBuilder::new(Kind::Custom(CONTROL_RESPONSE_KIND), encrypted)
         .tag(Tag::public_key(sender_pubkey))
         .tag(Tag::event(event.id));
+    if scheme != "nip04" {
+        response_event = response_event.tag(Tag::parse(["encryption", scheme]).unwrap());
+    }
     client.send_event_builder(response_event).await?;
     Ok(())
 }
 
 // ── LDK Event Loop ──────────────────────────────────────────────────────────
 
-/// Kind 23196 — NWC wallet notification
-const NWC_NOTIFICATION_KIND: u16 = 23196;
+/// Kind 23196 — NWC wallet notification (NIP-04)
+const NWC_NOTIFICATION_KIND_NIP04: u16 = 23196;
+/// Kind 23197 — NWC wallet notification (NIP-44)
+const NWC_NOTIFICATION_KIND_NIP44: u16 = 23197;
 /// Kind 23200 — NNC node control notification
 const NNC_NOTIFICATION_KIND: u16 = 23200;
 
@@ -2456,6 +2557,8 @@ fn build_channel_closed_notification(
 
 // ── Notification publishers ─────────────────────────────────────────────────
 
+/// Publish dual NWC notifications: Kind 23196 (NIP-04) + Kind 23197 (NIP-44).
+/// Per NIP-47 spec, wallet services supporting both schemes publish both kinds.
 async fn publish_nwc_notification(
     client: &Client,
     keys: &Keys,
@@ -2464,14 +2567,23 @@ async fn publish_nwc_notification(
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for sub_pubkey_hex in subscription_store::get_subscribers(notification_type) {
         let sub_pubkey = PublicKey::from_hex(&sub_pubkey_hex)?;
-        let encrypted = nip04::encrypt(keys.secret_key(), &sub_pubkey, payload)?;
-        let event = EventBuilder::new(Kind::Custom(NWC_NOTIFICATION_KIND), encrypted)
+
+        // Kind 23196 — NIP-04 encrypted (backward compat)
+        let encrypted_04 = nip04::encrypt(keys.secret_key(), &sub_pubkey, payload)?;
+        let event_04 = EventBuilder::new(Kind::Custom(NWC_NOTIFICATION_KIND_NIP04), encrypted_04)
             .tag(Tag::public_key(sub_pubkey));
-        client.send_event_builder(event).await?;
+        client.send_event_builder(event_04).await?;
+
+        // Kind 23197 — NIP-44 encrypted
+        let encrypted_44 = nip44::encrypt(keys.secret_key(), &sub_pubkey, payload, nip44::Version::V2)?;
+        let event_44 = EventBuilder::new(Kind::Custom(NWC_NOTIFICATION_KIND_NIP44), encrypted_44)
+            .tag(Tag::public_key(sub_pubkey));
+        client.send_event_builder(event_44).await?;
     }
     Ok(())
 }
 
+/// Publish NNC notification using NIP-44 only (no legacy NIP-04 for NNC).
 async fn publish_nnc_notification(
     client: &Client,
     keys: &Keys,
@@ -2480,7 +2592,7 @@ async fn publish_nnc_notification(
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for sub_pubkey_hex in subscription_store::get_subscribers(notification_type) {
         let sub_pubkey = PublicKey::from_hex(&sub_pubkey_hex)?;
-        let encrypted = nip04::encrypt(keys.secret_key(), &sub_pubkey, payload)?;
+        let encrypted = nip44::encrypt(keys.secret_key(), &sub_pubkey, payload, nip44::Version::V2)?;
         let event = EventBuilder::new(Kind::Custom(NNC_NOTIFICATION_KIND), encrypted)
             .tag(Tag::public_key(sub_pubkey));
         client.send_event_builder(event).await?;
