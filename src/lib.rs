@@ -39,8 +39,8 @@ static APPLIED_GRANT_EVENTS: OnceLock<RwLock<HashMap<String, AppliedGrantEvent>>
 static FORCED_EXECUTE_FAILURES: OnceLock<RwLock<HashSet<Method>>> = OnceLock::new();
 static LDK_SERVICE: OnceLock<RwLock<Option<Arc<LdkService>>>> = OnceLock::new();
 
-pub const CONTROL_REQUEST_KIND: u16 = 23196;
-pub const CONTROL_RESPONSE_KIND: u16 = 23197;
+pub const CONTROL_REQUEST_KIND: u16 = 23198;
+pub const CONTROL_RESPONSE_KIND: u16 = 23199;
 
 #[derive(Clone)]
 struct AppliedGrantEvent {
