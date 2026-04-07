@@ -220,6 +220,10 @@ impl LdkService {
         }))
     }
 
+    pub fn node(&self) -> &Arc<Node> {
+        &self.node
+    }
+
     pub fn node_id(&self) -> String {
         self.node.node_id().to_string()
     }

@@ -7,10 +7,13 @@ use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip47::{
     CancelHoldInvoiceResponse, ErrorCode, GetBalanceResponse, GetInfoResponse,
     LookupInvoiceResponse, MakeHoldInvoiceResponse, MakeInvoiceResponse, MakeNewAddressResponse,
-    MakeOfferResponse, Method, NIP47Error, PayInvoiceResponse, PayKeysendResponse,
+    MakeOfferResponse, Method, NIP47Error, Notification, NotificationResult, NotificationType,
+    PayInvoiceResponse, PayKeysendResponse, PaymentNotification,
     PayOfferResponse, PayOnchainResponse, Request, RequestParams, Response, ResponseResult,
-    SettleHoldInvoiceResponse, TransactionState, TransactionType,
+    SettleHoldInvoiceResponse, SubscribeNotificationsResponse, TransactionState, TransactionType,
     LookupOfferResponse, LookupAddressResponse, AddressTransaction,
+    NncNotification, NncNotificationType, NncNotificationResult,
+    ChannelOpenedNotification, ChannelClosedNotification,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -23,7 +26,7 @@ mod state;
 pub mod usage_profile;
 
 use crate::state::store::access_store::SharedRateState;
-use crate::state::{offer_store, address_store};
+use crate::state::{offer_store, address_store, subscription_store};
 pub use rate_limit_rule::RateLimitRule;
 pub use state::rate_state::RateStateError;
 pub use usage_profile::get_usage_profile;
@@ -140,6 +143,10 @@ fn should_apply_grant_event(target_pubkey: &str, event: &Event) -> bool {
 
 pub fn clear_usage_profiles() {
     usage_profile::clear_all_usage_profiles_and_states();
+}
+
+pub fn clear_subscriptions() {
+    subscription_store::clear();
 }
 
 #[doc(hidden)]
@@ -559,6 +566,7 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::MakeOffer,
     Method::LookupOffer,
     Method::LookupAddress,
+    Method::SubscribeNotifications,
 ];
 
 pub const CONTROL_INFO_KIND: u16 = 13198;
@@ -570,6 +578,7 @@ const SUPPORTED_CONTROL_METHODS: &[&str] = &[
     "list_channels",
     "list_peers",
     "disconnect_peer",
+    "subscribe_notifications",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -757,8 +766,27 @@ pub async fn run_nwc_service_with_ldk(
     relay_url: &str,
     ldk_service: Arc<LdkService>,
 ) -> Result<Client> {
-    set_ldk_service(ldk_service);
-    run_nwc_service(keys, relay_url).await
+    set_ldk_service(ldk_service.clone());
+    let client = run_nwc_service(keys.clone(), relay_url).await?;
+
+    // Spawn LDK event loop for notification publishing
+    let event_client = client.clone();
+    let event_keys = keys.clone();
+    let event_ldk = ldk_service;
+    tokio::spawn(async move {
+        loop {
+            let event = event_ldk.node().next_event_async().await;
+            if let Err(e) = handle_ldk_event(&event_client, &event_keys, &event_ldk, &event).await
+            {
+                eprintln!("Failed to handle LDK event: {e}");
+            }
+            if let Err(e) = event_ldk.node().event_handled() {
+                eprintln!("Failed to mark event handled: {e}");
+            }
+        }
+    });
+
+    Ok(client)
 }
 
 fn payment_hash_from_kind(kind: &PaymentKind) -> Option<String> {
@@ -874,7 +902,15 @@ impl Handler for GetInfoHandler {
                 block_height: Some(block_height),
                 block_hash: None,
                 methods,
-                notifications: vec![],
+                notifications: if get_ldk_service().is_some() {
+                    vec![
+                        "payment_received".into(),
+                        "payment_sent".into(),
+                        "hold_invoice_accepted".into(),
+                    ]
+                } else {
+                    vec![]
+                },
             })),
         })
     }
@@ -1661,12 +1697,31 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
     })
 }
 
+/// Known NWC notification types for subscribe_notifications validation.
+const KNOWN_NWC_NOTIFICATION_TYPES: &[&str] = &[
+    "payment_received",
+    "payment_sent",
+    "hold_invoice_accepted",
+];
+
+/// Known NNC notification types for subscribe_notifications validation.
+const KNOWN_NNC_NOTIFICATION_TYPES: &[&str] = &[
+    "channel_opened",
+    "channel_closed",
+];
+
 async fn process_nwc_request(request: Request, event: &Event) -> Response {
     // Check that the user is authorized
     let _applied_state_updates = match verify_access(&request, event) {
         Ok(state_updates) => state_updates,
         Err(response) => return response,
     };
+
+    // Handle subscribe_notifications specially since it needs the caller pubkey
+    // for subscription management and doesn't follow the normal handler pattern.
+    if request.method == Method::SubscribeNotifications {
+        return handle_nwc_subscribe_notifications(&request, event);
+    }
 
     // Check that we support the requested method
     if !request_handlers().contains_key(&request.method) {
@@ -2045,6 +2100,52 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
     }
 
+    if request.method == "subscribe_notifications" {
+        #[derive(Deserialize)]
+        struct SubscribeParams {
+            types: Vec<String>,
+        }
+        let params = match serde_json::from_value::<SubscribeParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid subscribe_notifications params: {e}"),
+                    )),
+                };
+            }
+        };
+
+        // Validate that all requested types are known NNC notification types
+        for t in &params.types {
+            if !KNOWN_NNC_NOTIFICATION_TYPES.contains(&t.as_str()) {
+                return ControlResponse {
+                    result_type: "subscribe_notifications".to_string(),
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("unknown notification type: {t}"),
+                    )),
+                };
+            }
+        }
+
+        if params.types.is_empty() {
+            subscription_store::unsubscribe(caller_pubkey);
+        } else {
+            subscription_store::subscribe(caller_pubkey, &params.types);
+        }
+
+        return ControlResponse {
+            result_type: "subscribe_notifications".to_string(),
+            result: Some(json!({})),
+            error: None,
+        };
+    }
+
     ControlResponse {
         result_type: request.method,
         result: None,
@@ -2052,6 +2153,50 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
             "NOT_IMPLEMENTED",
             "control method not implemented yet".to_string(),
         )),
+    }
+}
+
+fn handle_nwc_subscribe_notifications(request: &Request, event: &Event) -> Response {
+    let caller_pubkey = event.pubkey.to_string();
+
+    if let RequestParams::SubscribeNotifications(params) = &request.params {
+        // Validate that all requested types are known NWC notification types
+        for t in &params.types {
+            if !KNOWN_NWC_NOTIFICATION_TYPES.contains(&t.as_str()) {
+                return Response {
+                    result_type: Method::SubscribeNotifications,
+                    error: Some(NIP47Error {
+                        code: ErrorCode::Other,
+                        message: format!("unknown notification type: {t}"),
+                    }),
+                    result: None,
+                };
+            }
+        }
+
+        if params.types.is_empty() {
+            // Empty types list means unsubscribe
+            subscription_store::unsubscribe(&caller_pubkey);
+        } else {
+            subscription_store::subscribe(&caller_pubkey, &params.types);
+        }
+
+        return Response {
+            result_type: Method::SubscribeNotifications,
+            error: None,
+            result: Some(ResponseResult::SubscribeNotifications(
+                SubscribeNotificationsResponse {},
+            )),
+        };
+    }
+
+    Response {
+        result_type: Method::SubscribeNotifications,
+        error: Some(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for subscribe_notifications".to_string(),
+        }),
+        result: None,
     }
 }
 
@@ -2081,5 +2226,264 @@ async fn handle_control_request(
         .tag(Tag::public_key(sender_pubkey))
         .tag(Tag::event(event.id));
     client.send_event_builder(response_event).await?;
+    Ok(())
+}
+
+// ── LDK Event Loop ──────────────────────────────────────────────────────────
+
+/// Kind 23196 — NWC wallet notification
+const NWC_NOTIFICATION_KIND: u16 = 23196;
+/// Kind 23200 — NNC node control notification
+const NNC_NOTIFICATION_KIND: u16 = 23200;
+
+async fn handle_ldk_event(
+    client: &Client,
+    keys: &Keys,
+    ldk_service: &Arc<LdkService>,
+    event: &ldk_node::Event,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use ldk_node::Event;
+
+    match event {
+        Event::PaymentReceived {
+            payment_hash,
+            amount_msat,
+            ..
+        } => {
+            let notif = build_payment_received_notification(
+                &hex_payment_hash(&payment_hash.0),
+                *amount_msat,
+            );
+            let json = notif.as_json();
+            publish_nwc_notification(client, keys, "payment_received", &json).await?;
+        }
+        Event::PaymentSuccessful {
+            payment_hash,
+            fee_paid_msat,
+            ..
+        } => {
+            let notif = build_payment_sent_notification(
+                &hex_payment_hash(&payment_hash.0),
+                fee_paid_msat,
+            );
+            let json = notif.as_json();
+            publish_nwc_notification(client, keys, "payment_sent", &json).await?;
+        }
+        Event::PaymentClaimable {
+            payment_hash,
+            claimable_amount_msat,
+            claim_deadline,
+            ..
+        } => {
+            let notif = build_hold_invoice_accepted_notification(
+                &hex_payment_hash(&payment_hash.0),
+                *claimable_amount_msat,
+                *claim_deadline,
+            );
+            let json = notif.as_json();
+            publish_nwc_notification(client, keys, "hold_invoice_accepted", &json).await?;
+        }
+        Event::ChannelReady {
+            channel_id,
+            counterparty_node_id,
+            funding_txo,
+            ..
+        } => {
+            let notif = build_channel_opened_notification(
+                ldk_service,
+                &channel_id.to_string(),
+                counterparty_node_id.as_ref(),
+                funding_txo.as_ref(),
+            );
+            let json = notif.as_json();
+            publish_nnc_notification(client, keys, "channel_opened", &json).await?;
+        }
+        Event::ChannelClosed {
+            channel_id,
+            counterparty_node_id,
+            reason,
+            ..
+        } => {
+            let notif = build_channel_closed_notification(
+                &channel_id.to_string(),
+                counterparty_node_id.as_ref(),
+                reason.as_ref(),
+            );
+            let json = notif.as_json();
+            publish_nnc_notification(client, keys, "channel_closed", &json).await?;
+        }
+        _ => {} // Ignore other events for now
+    }
+    Ok(())
+}
+
+// ── Notification builders ───────────────────────────────────────────────────
+
+fn build_payment_received_notification(payment_hash: &str, amount_msat: u64) -> Notification {
+    Notification {
+        notification_type: NotificationType::PaymentReceived,
+        notification: NotificationResult::PaymentReceived(PaymentNotification {
+            transaction_type: Some(TransactionType::Incoming),
+            state: Some(TransactionState::Settled),
+            invoice: String::new(),
+            description: None,
+            description_hash: None,
+            preimage: String::new(),
+            payment_hash: payment_hash.to_string(),
+            amount: amount_msat,
+            fees_paid: 0,
+            created_at: Timestamp::now(),
+            expires_at: None,
+            settled_at: Timestamp::now(),
+            metadata: None,
+        }),
+    }
+}
+
+fn build_payment_sent_notification(
+    payment_hash: &str,
+    fee_paid_msat: &Option<u64>,
+) -> Notification {
+    Notification {
+        notification_type: NotificationType::PaymentSent,
+        notification: NotificationResult::PaymentSent(PaymentNotification {
+            transaction_type: Some(TransactionType::Outgoing),
+            state: Some(TransactionState::Settled),
+            invoice: String::new(),
+            description: None,
+            description_hash: None,
+            preimage: String::new(),
+            payment_hash: payment_hash.to_string(),
+            amount: 0,
+            fees_paid: fee_paid_msat.unwrap_or(0),
+            created_at: Timestamp::now(),
+            expires_at: None,
+            settled_at: Timestamp::now(),
+            metadata: None,
+        }),
+    }
+}
+
+fn build_hold_invoice_accepted_notification(
+    payment_hash: &str,
+    claimable_amount_msat: u64,
+    claim_deadline: Option<u32>,
+) -> Notification {
+    use nwc::nostr::nips::nip47::HoldInvoiceAcceptedNotification;
+    Notification {
+        notification_type: NotificationType::HoldInvoiceAccepted,
+        notification: NotificationResult::HoldInvoiceAccepted(HoldInvoiceAcceptedNotification {
+            transaction_type: TransactionType::Incoming,
+            state: Some(TransactionState::Accepted),
+            invoice: String::new(),
+            description: None,
+            description_hash: None,
+            payment_hash: payment_hash.to_string(),
+            amount: claimable_amount_msat,
+            created_at: Timestamp::now(),
+            expires_at: Timestamp::now(),
+            settle_deadline: claim_deadline.unwrap_or(0),
+            metadata: None,
+        }),
+    }
+}
+
+fn build_channel_opened_notification(
+    ldk_service: &Arc<LdkService>,
+    channel_id: &str,
+    counterparty: Option<&ldk_node::bitcoin::secp256k1::PublicKey>,
+    funding_txo: Option<&ldk_node::bitcoin::OutPoint>,
+) -> NncNotification {
+    // Try to find the channel in the channel list for richer details
+    let channels = ldk_service.list_channels();
+    let channel = channels.iter().find(|c| c.id == channel_id);
+
+    NncNotification {
+        notification_type: NncNotificationType::ChannelOpened,
+        notification: NncNotificationResult::ChannelOpened(ChannelOpenedNotification {
+            id: channel_id.to_string(),
+            short_channel_id: channel.and_then(|c| c.short_channel_id.clone()),
+            peer_pubkey: counterparty
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            capacity: channel.map(|c| c.capacity).unwrap_or(0),
+            local_balance: channel.map(|c| c.local_balance).unwrap_or(0),
+            remote_balance: channel.map(|c| c.remote_balance).unwrap_or(0),
+            funding_txid: funding_txo
+                .map(|txo| txo.txid.to_string())
+                .unwrap_or_default(),
+            is_private: channel.map(|c| c.is_private).unwrap_or(false),
+        }),
+    }
+}
+
+fn build_channel_closed_notification(
+    channel_id: &str,
+    counterparty: Option<&ldk_node::bitcoin::secp256k1::PublicKey>,
+    reason: Option<&ldk_node::lightning::events::ClosureReason>,
+) -> NncNotification {
+    let close_type = match reason {
+        Some(ldk_node::lightning::events::ClosureReason::CounterpartyForceClosed { .. }) => {
+            "force"
+        }
+        Some(ldk_node::lightning::events::ClosureReason::HolderForceClosed { .. }) => "force",
+        Some(ldk_node::lightning::events::ClosureReason::LegacyCooperativeClosure) => {
+            "cooperative"
+        }
+        Some(ldk_node::lightning::events::ClosureReason::LocallyInitiatedCooperativeClosure) => {
+            "cooperative"
+        }
+        Some(ldk_node::lightning::events::ClosureReason::CounterpartyInitiatedCooperativeClosure) => {
+            "cooperative"
+        }
+        _ => "unknown",
+    };
+
+    NncNotification {
+        notification_type: NncNotificationType::ChannelClosed,
+        notification: NncNotificationResult::ChannelClosed(ChannelClosedNotification {
+            id: channel_id.to_string(),
+            short_channel_id: None,
+            peer_pubkey: counterparty
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            capacity: 0,
+            closing_txid: None,
+            close_type: close_type.to_string(),
+        }),
+    }
+}
+
+// ── Notification publishers ─────────────────────────────────────────────────
+
+async fn publish_nwc_notification(
+    client: &Client,
+    keys: &Keys,
+    notification_type: &str,
+    payload: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for sub_pubkey_hex in subscription_store::get_subscribers(notification_type) {
+        let sub_pubkey = PublicKey::from_hex(&sub_pubkey_hex)?;
+        let encrypted = nip04::encrypt(keys.secret_key(), &sub_pubkey, payload)?;
+        let event = EventBuilder::new(Kind::Custom(NWC_NOTIFICATION_KIND), encrypted)
+            .tag(Tag::public_key(sub_pubkey));
+        client.send_event_builder(event).await?;
+    }
+    Ok(())
+}
+
+async fn publish_nnc_notification(
+    client: &Client,
+    keys: &Keys,
+    notification_type: &str,
+    payload: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for sub_pubkey_hex in subscription_store::get_subscribers(notification_type) {
+        let sub_pubkey = PublicKey::from_hex(&sub_pubkey_hex)?;
+        let encrypted = nip04::encrypt(keys.secret_key(), &sub_pubkey, payload)?;
+        let event = EventBuilder::new(Kind::Custom(NNC_NOTIFICATION_KIND), encrypted)
+            .tag(Tag::public_key(sub_pubkey));
+        client.send_event_builder(event).await?;
+    }
     Ok(())
 }
