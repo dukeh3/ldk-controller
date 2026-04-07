@@ -14,13 +14,13 @@ use nwc::nostr::nips::nip47::{
     SettleHoldInvoiceResponse, SubscribeNotificationsResponse, TransactionState, TransactionType,
     LookupOfferResponse, LookupAddressResponse, AddressTransaction,
     NncNotification, NncNotificationType, NncNotificationResult,
-    ChannelOpenedNotification, ChannelClosedNotification,
+    ChannelOpenedNotification, ChannelClosedNotification, PaymentMethod,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::lightning::{LdkService, LdkServiceError, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
+use crate::lightning::{LdkBalance, LdkService, LdkServiceError, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 pub mod rate_limit_rule;
 pub mod lightning;
 mod state;
@@ -826,6 +826,15 @@ fn preimage_from_kind(kind: &PaymentKind) -> Option<String> {
     }
 }
 
+fn payment_method_from_kind(kind: &PaymentKind) -> Option<PaymentMethod> {
+    match kind {
+        PaymentKind::Bolt11 { .. } | PaymentKind::Bolt11Jit { .. } => Some(PaymentMethod::Bolt11),
+        PaymentKind::Bolt12Offer { .. } | PaymentKind::Bolt12Refund { .. } => Some(PaymentMethod::Bolt12),
+        PaymentKind::Spontaneous { .. } => Some(PaymentMethod::Keysend),
+        _ => None,
+    }
+}
+
 fn hex_payment_hash(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -870,6 +879,7 @@ fn payment_details_to_lookup_invoice_response(payment: &PaymentDetails) -> Looku
         expires_at: None,
         settled_at,
         metadata: None,
+        payment_method: payment_method_from_kind(&payment.kind),
     }
 }
 
@@ -945,24 +955,26 @@ impl Handler for GetBalanceHandler {
     }
 
     fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
-        let balance = if let Some(ldk_service) = get_ldk_service() {
+        let bal = if let Some(ldk_service) = get_ldk_service() {
             ldk_service.sync_wallets().map_err(|e| NIP47Error {
                 code: ErrorCode::Other,
                 message: format!("ldk sync failed: {e}"),
             })?;
-            ldk_service.get_balance_msat().map_err(|e| NIP47Error {
+            ldk_service.get_balance().map_err(|e| NIP47Error {
                 code: ErrorCode::Other,
                 message: format!("ldk balance failed: {e}"),
             })?
         } else {
-            0
+            LdkBalance { total_msat: 0, lightning_msat: 0, onchain_msat: 0 }
         };
 
         Ok(Response {
             result_type: Method::GetBalance,
             error: None,
             result: Some(ResponseResult::GetBalance(GetBalanceResponse {
-                balance,
+                balance: bal.total_msat,
+                lightning_balance: Some(bal.lightning_msat),
+                onchain_balance: Some(bal.onchain_msat),
             })),
         })
     }
@@ -1217,6 +1229,7 @@ impl Handler for LookupInvoiceHandler {
                 expires_at: None,
                 settled_at: None,
                 metadata: None,
+                payment_method: None,
             })),
         })
     }
@@ -1251,6 +1264,7 @@ impl Handler for ListTransactionsHandler {
                     params.offset,
                     params.unpaid,
                     direction,
+                    params.payment_method,
                 );
 
                 let transactions: Vec<LookupInvoiceResponse> = payments

@@ -7,6 +7,7 @@ use ldk_node::bitcoin::Address;
 use ldk_node::lightning::offers::offer::Offer;
 use ldk_node::lightning::routing::gossip::NodeId;
 use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
+use nwc::nostr::nips::nip47::PaymentMethod;
 use ldk_node::{Builder, Node};
 use serde::Serialize;
 use std::fmt;
@@ -134,6 +135,13 @@ impl fmt::Display for LdkServiceError {
 }
 
 impl std::error::Error for LdkServiceError {}
+
+#[derive(Debug, Clone)]
+pub struct LdkBalance {
+    pub total_msat: u64,
+    pub lightning_msat: u64,
+    pub onchain_msat: u64,
+}
 
 pub struct LdkNodeStatus {
     pub latest_best_block_height: u32,
@@ -305,7 +313,7 @@ impl LdkService {
             .map_err(|e| LdkServiceError::SyncFailed(e.to_string()))
     }
 
-    pub fn get_balance_msat(&self) -> Result<u64, LdkServiceError> {
+    pub fn get_balance(&self) -> Result<LdkBalance, LdkServiceError> {
         let balances = self.node.list_balances();
         let onchain_msat = balances
             .spendable_onchain_balance_sats
@@ -319,11 +327,16 @@ impl LdkService {
             .ok_or(LdkServiceError::BalanceOverflow {
                 sats: balances.total_lightning_balance_sats,
             })?;
-        onchain_msat
+        let total_msat = onchain_msat
             .checked_add(lightning_msat)
             .ok_or(LdkServiceError::BalanceOverflow {
                 sats: balances.spendable_onchain_balance_sats + balances.total_lightning_balance_sats,
-            })
+            })?;
+        Ok(LdkBalance { total_msat, lightning_msat, onchain_msat })
+    }
+
+    pub fn get_balance_msat(&self) -> Result<u64, LdkServiceError> {
+        Ok(self.get_balance()?.total_msat)
     }
 
     pub fn new_onchain_address(&self) -> Result<String, LdkServiceError> {
@@ -745,6 +758,7 @@ impl LdkService {
         offset: Option<u64>,
         unpaid: Option<bool>,
         direction: Option<PaymentDirection>,
+        payment_method: Option<PaymentMethod>,
     ) -> Vec<PaymentDetails> {
         let mut payments: Vec<PaymentDetails> = self
             .node
@@ -763,6 +777,19 @@ impl LdkService {
                 }
                 if let Some(dir) = &direction {
                     if p.direction != *dir {
+                        return false;
+                    }
+                }
+                if let Some(pm) = &payment_method {
+                    let matches = match (pm, &p.kind) {
+                        (PaymentMethod::Bolt11, PaymentKind::Bolt11 { .. })
+                        | (PaymentMethod::Bolt11, PaymentKind::Bolt11Jit { .. }) => true,
+                        (PaymentMethod::Bolt12, PaymentKind::Bolt12Offer { .. })
+                        | (PaymentMethod::Bolt12, PaymentKind::Bolt12Refund { .. }) => true,
+                        (PaymentMethod::Keysend, PaymentKind::Spontaneous { .. }) => true,
+                        _ => false,
+                    };
+                    if !matches {
                         return false;
                     }
                 }
