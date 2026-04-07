@@ -126,6 +126,10 @@ impl fmt::Display for LdkServiceError {
 
 impl std::error::Error for LdkServiceError {}
 
+pub struct LdkNodeStatus {
+    pub latest_best_block_height: u32,
+}
+
 pub struct LdkService {
     node: Arc<Node>,
     network: Network,
@@ -145,17 +149,29 @@ pub struct LdkInvoiceResult {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LdkChannelInfo {
-    pub channel_id: String,
-    pub counterparty_pubkey: String,
-    pub is_channel_ready: bool,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_channel_id: Option<String>,
+    pub peer_pubkey: String,
+    pub state: String,
+    pub is_private: bool,
+    pub local_balance: u64,
+    pub remote_balance: u64,
+    pub capacity: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funding_txid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funding_output_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LdkPeerInfo {
-    pub node_id: String,
+    pub pubkey: String,
     pub address: String,
-    pub is_persisted: bool,
-    pub is_connected: bool,
+    pub connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    pub num_channels: usize,
 }
 
 impl LdkService {
@@ -200,6 +216,13 @@ impl LdkService {
         self.node.node_id().to_string()
     }
 
+    pub fn status(&self) -> LdkNodeStatus {
+        let status = self.node.status();
+        LdkNodeStatus {
+            latest_best_block_height: status.current_best_block.height,
+        }
+    }
+
     pub fn network(&self) -> &'static str {
         match self.network {
             Network::Regtest => "regtest",
@@ -217,9 +240,24 @@ impl LdkService {
     }
 
     pub fn get_balance_msat(&self) -> Result<u64, LdkServiceError> {
-        let sats = self.node.list_balances().spendable_onchain_balance_sats;
-        sats.checked_mul(1000)
-            .ok_or(LdkServiceError::BalanceOverflow { sats })
+        let balances = self.node.list_balances();
+        let onchain_msat = balances
+            .spendable_onchain_balance_sats
+            .checked_mul(1000)
+            .ok_or(LdkServiceError::BalanceOverflow {
+                sats: balances.spendable_onchain_balance_sats,
+            })?;
+        let lightning_msat = balances
+            .total_lightning_balance_sats
+            .checked_mul(1000)
+            .ok_or(LdkServiceError::BalanceOverflow {
+                sats: balances.total_lightning_balance_sats,
+            })?;
+        onchain_msat
+            .checked_add(lightning_msat)
+            .ok_or(LdkServiceError::BalanceOverflow {
+                sats: balances.spendable_onchain_balance_sats + balances.total_lightning_balance_sats,
+            })
     }
 
     pub fn new_onchain_address(&self) -> Result<String, LdkServiceError> {
@@ -393,24 +431,41 @@ impl LdkService {
         self.node
             .list_channels()
             .iter()
-            .map(|channel| LdkChannelInfo {
-                channel_id: channel.channel_id.to_string(),
-                counterparty_pubkey: channel.counterparty_node_id.to_string(),
-                is_channel_ready: channel.is_channel_ready,
+            .map(|channel| {
+                let state = if channel.is_channel_ready && channel.is_usable {
+                    "active"
+                } else if channel.is_channel_ready {
+                    "inactive"
+                } else {
+                    "pending_open"
+                };
+
+                let short_channel_id = channel.short_channel_id.map(|scid| {
+                    let block = scid >> 40;
+                    let tx = (scid >> 16) & 0xFFFFFF;
+                    let vout = scid & 0xFFFF;
+                    format!("{block}x{tx}x{vout}")
+                });
+
+                let (funding_txid, funding_output_index) = channel
+                    .funding_txo
+                    .map(|txo| (Some(txo.txid.to_string()), Some(txo.vout)))
+                    .unwrap_or((None, None));
+
+                LdkChannelInfo {
+                    id: channel.channel_id.to_string(),
+                    short_channel_id,
+                    peer_pubkey: channel.counterparty_node_id.to_string(),
+                    state: state.to_string(),
+                    is_private: !channel.is_announced,
+                    local_balance: channel.outbound_capacity_msat,
+                    remote_balance: channel.inbound_capacity_msat,
+                    capacity: channel.channel_value_sats * 1000,
+                    funding_txid,
+                    funding_output_index,
+                }
             })
             .collect()
-    }
-
-    pub fn get_channel(&self, channel_id: &str) -> Option<LdkChannelInfo> {
-        self.node
-            .list_channels()
-            .iter()
-            .find(|channel| channel.channel_id.to_string() == channel_id)
-            .map(|channel| LdkChannelInfo {
-                channel_id: channel.channel_id.to_string(),
-                counterparty_pubkey: channel.counterparty_node_id.to_string(),
-                is_channel_ready: channel.is_channel_ready,
-            })
     }
 
     pub fn close_channel(&self, channel_id: &str, force: bool) -> Result<(), LdkServiceError> {
@@ -440,14 +495,22 @@ impl LdkService {
     }
 
     pub fn list_peers(&self) -> Vec<LdkPeerInfo> {
+        let channels = self.node.list_channels();
         self.node
             .list_peers()
             .iter()
-            .map(|peer| LdkPeerInfo {
-                node_id: peer.node_id.to_string(),
-                address: peer.address.to_string(),
-                is_persisted: peer.is_persisted,
-                is_connected: peer.is_connected,
+            .map(|peer| {
+                let num_channels = channels
+                    .iter()
+                    .filter(|c| c.counterparty_node_id == peer.node_id)
+                    .count();
+                LdkPeerInfo {
+                    pubkey: peer.node_id.to_string(),
+                    address: peer.address.to_string(),
+                    connected: peer.is_connected,
+                    alias: None,
+                    num_channels,
+                }
             })
             .collect()
     }

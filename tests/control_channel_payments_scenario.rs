@@ -187,10 +187,9 @@ async fn alice_opens_channel_then_both_directions_pay() -> Result<()> {
             "method": "open_channel",
             "params": {
                 "pubkey": bob_pubkey,
-                "host": "127.0.0.1",
-                "port": port_b,
-                "capacity_sats": 2_000_000,
-                "push_msat": 1_000_000_000u64
+                "host": format!("127.0.0.1:{port_b}"),
+                "amount": 2_000_000,
+                "push_amount": 1_000_000u64
             }
         }),
     )

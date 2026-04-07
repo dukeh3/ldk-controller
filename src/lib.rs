@@ -220,7 +220,13 @@ fn verify_access(request: &Request, event: &Event) -> Result<Vec<StateUpdateRequ
             }
             match methods.get(&request.method) {
                 Some(rule) => Some(rule.clone()),
-                None => return Err(access_denied_response(&request.method)),
+                None => {
+                    // Check for "ALL" special key
+                    match methods.get(&Method::Unknown("ALL".to_string())) {
+                        Some(rule) => Some(rule.clone()),
+                        None => return Err(access_denied_response(&request.method)),
+                    }
+                }
             }
         }
     };
@@ -544,13 +550,13 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::SettleHoldInvoice,
 ];
 
+pub const CONTROL_INFO_KIND: u16 = 13198;
+
 const SUPPORTED_CONTROL_METHODS: &[&str] = &[
-    "new_onchain_address",
     "connect_peer",
     "open_channel",
     "close_channel",
     "list_channels",
-    "get_channel",
     "list_peers",
     "disconnect_peer",
 ];
@@ -565,18 +571,23 @@ struct ControlRequest {
 #[derive(Debug, Clone, Deserialize)]
 struct OpenChannelParams {
     pubkey: String,
-    host: String,
-    port: u16,
-    capacity_sats: u64,
     #[serde(default)]
-    push_msat: Option<u64>,
+    host: Option<String>,
+    amount: u64,
+    #[serde(default)]
+    push_amount: Option<u64>,
+    #[serde(default)]
+    private: Option<bool>,
+    #[serde(default)]
+    close_address: Option<String>,
+    #[serde(default)]
+    notify: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ConnectPeerParams {
     pubkey: String,
     host: String,
-    port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -585,15 +596,14 @@ struct DisconnectPeerParams {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct GetChannelParams {
-    channel_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct CloseChannelParams {
-    channel_id: String,
+    id: String,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    close_address: Option<String>,
+    #[serde(default)]
+    notify: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -623,7 +633,7 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
     client.add_relay(relay_url).await?;
     client.connect().await;
 
-    // Publish capabilities (Kind 13194) — space-separated list of supported methods
+    // Publish NWC capabilities (Kind 13194) — space-separated list of supported methods
     let methods_str: String = SUPPORTED_METHODS
         .iter()
         .map(|m| m.as_str())
@@ -631,6 +641,11 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
         .join(" ");
     let info_event = EventBuilder::new(Kind::WalletConnectInfo, methods_str);
     client.send_event_builder(info_event).await?;
+
+    // Publish NNC capabilities (Kind 13198) — space-separated list of supported control methods
+    let control_methods_str: String = SUPPORTED_CONTROL_METHODS.join(" ");
+    let nnc_info_event = EventBuilder::new(Kind::Custom(CONTROL_INFO_KIND), control_methods_str);
+    client.send_event_builder(nnc_info_event).await?;
 
     let our_pubkey = keys.public_key();
 
@@ -755,12 +770,17 @@ impl Handler for GetInfoHandler {
 
     fn execute(&self, _req: &Request, caller_pubkey: &str) -> Result<Response, NIP47Error> {
         let methods = allowed_methods_for(caller_pubkey);
-        let (pubkey, network) = if let Some(ldk_service) = get_ldk_service() {
-            (ldk_service.node_id(), ldk_service.network().to_string())
+        let (pubkey, network, block_height) = if let Some(ldk_service) = get_ldk_service() {
+            (
+                ldk_service.node_id(),
+                ldk_service.network().to_string(),
+                ldk_service.status().latest_best_block_height,
+            )
         } else {
             (
                 GLOBAL_KEYS.get().unwrap().public_key().to_string(),
                 "regtest".to_string(),
+                0u32,
             )
         };
         Ok(Response {
@@ -771,7 +791,7 @@ impl Handler for GetInfoHandler {
                 color: None,
                 pubkey: Some(pubkey),
                 network: Some(network),
-                block_height: Some(0),
+                block_height: Some(block_height),
                 block_hash: None,
                 methods,
                 notifications: vec![],
@@ -1270,6 +1290,8 @@ fn allowed_methods_for(caller_pubkey: &str) -> Vec<Method> {
         Some(methods) => {
             if methods.is_empty() {
                 Vec::new()
+            } else if methods.contains_key(&Method::Unknown("ALL".to_string())) {
+                SUPPORTED_METHODS.to_vec()
             } else {
                 SUPPORTED_METHODS
                     .iter()
@@ -1327,7 +1349,9 @@ fn authorize_control_method(caller_pubkey: &str, method: &str) -> Result<(), Con
         ));
     };
 
-    if control_methods.is_empty() || !control_methods.contains_key(method) {
+    if control_methods.is_empty()
+        || (!control_methods.contains_key(method) && !control_methods.contains_key("ALL"))
+    {
         return Err(control_error(
             "RESTRICTED",
             "control access denied, insufficient permission".to_string(),
@@ -1376,13 +1400,13 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
                 };
             }
         };
-        if params.capacity_sats == 0 {
+        if params.amount == 0 {
             return ControlResponse {
                 result_type: "open_channel".to_string(),
                 result: None,
                 error: Some(control_error(
                     "OTHER",
-                    "capacity_sats must be greater than 0".to_string(),
+                    "amount must be greater than 0".to_string(),
                 )),
             };
         }
@@ -1397,12 +1421,13 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
             };
         };
 
-        let address = format!("{}:{}", params.host, params.port);
+        let push_msat = params.push_amount.map(|sats| sats * 1000);
+        let address = params.host.as_deref().unwrap_or("");
         if let Err(e) = ldk_service.open_channel(
             &params.pubkey,
-            &address,
-            params.capacity_sats,
-            params.push_msat,
+            address,
+            params.amount,
+            push_msat,
         ) {
             return ControlResponse {
                 result_type: "open_channel".to_string(),
@@ -1416,36 +1441,8 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
 
         return ControlResponse {
             result_type: "open_channel".to_string(),
-            result: Some(json!({ "status": "accepted" })),
+            result: Some(json!({})),
             error: None,
-        };
-    }
-
-    if request.method == "new_onchain_address" {
-        let Some(ldk_service) = get_ldk_service() else {
-            return ControlResponse {
-                result_type: "new_onchain_address".to_string(),
-                result: None,
-                error: Some(control_error(
-                    "OTHER",
-                    "ldk service unavailable".to_string(),
-                )),
-            };
-        };
-        return match ldk_service.new_onchain_address() {
-            Ok(address) => ControlResponse {
-                result_type: "new_onchain_address".to_string(),
-                result: Some(json!({ "address": address })),
-                error: None,
-            },
-            Err(e) => ControlResponse {
-                result_type: "new_onchain_address".to_string(),
-                result: None,
-                error: Some(control_error(
-                    "OTHER",
-                    format!("new_onchain_address failed: {e}"),
-                )),
-            },
         };
     }
 
@@ -1473,8 +1470,7 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
                 )),
             };
         };
-        let address = format!("{}:{}", params.host, params.port);
-        if let Err(e) = ldk_service.connect_peer(&params.pubkey, &address) {
+        if let Err(e) = ldk_service.connect_peer(&params.pubkey, &params.host) {
             return ControlResponse {
                 result_type: "connect_peer".to_string(),
                 result: None,
@@ -1540,7 +1536,7 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
         return ControlResponse {
             result_type: request.method,
-            result: Some(serde_json::to_value(channels).unwrap_or(Value::Array(Vec::new()))),
+            result: Some(json!({ "channels": channels })),
             error: None,
         };
     }
@@ -1553,49 +1549,8 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
         return ControlResponse {
             result_type: request.method,
-            result: Some(serde_json::to_value(peers).unwrap_or(Value::Array(Vec::new()))),
+            result: Some(json!({ "peers": peers })),
             error: None,
-        };
-    }
-
-    if request.method == "get_channel" {
-        let params = match serde_json::from_value::<GetChannelParams>(request.params.clone()) {
-            Ok(params) => params,
-            Err(e) => {
-                return ControlResponse {
-                    result_type: request.method,
-                    result: None,
-                    error: Some(control_error(
-                        "OTHER",
-                        format!("invalid get_channel params: {e}"),
-                    )),
-                };
-            }
-        };
-        let Some(ldk_service) = get_ldk_service() else {
-            return ControlResponse {
-                result_type: "get_channel".to_string(),
-                result: None,
-                error: Some(control_error(
-                    "OTHER",
-                    "ldk service unavailable".to_string(),
-                )),
-            };
-        };
-        return match ldk_service.get_channel(&params.channel_id) {
-            Some(channel) => ControlResponse {
-                result_type: "get_channel".to_string(),
-                result: Some(serde_json::to_value(channel).unwrap_or(Value::Null)),
-                error: None,
-            },
-            None => ControlResponse {
-                result_type: "get_channel".to_string(),
-                result: None,
-                error: Some(control_error(
-                    "NOT_FOUND",
-                    format!("channel not found: {}", params.channel_id),
-                )),
-            },
         };
     }
 
@@ -1623,7 +1578,7 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
                 )),
             };
         };
-        if let Err(e) = ldk_service.close_channel(&params.channel_id, params.force) {
+        if let Err(e) = ldk_service.close_channel(&params.id, params.force) {
             return ControlResponse {
                 result_type: "close_channel".to_string(),
                 result: None,
@@ -1635,7 +1590,7 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         }
         return ControlResponse {
             result_type: "close_channel".to_string(),
-            result: Some(json!({ "status": "accepted", "force": params.force })),
+            result: Some(json!({})),
             error: None,
         };
     }

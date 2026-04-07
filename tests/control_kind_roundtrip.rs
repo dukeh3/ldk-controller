@@ -237,9 +237,10 @@ async fn control_allowed_when_method_listed_returns_channels_array() -> Result<(
 
     assert_eq!(response["result_type"], "list_channels");
     assert!(response["error"].is_null(), "expected no error, got: {:?}", response);
+    let channels = &response["result"]["channels"];
     assert!(
-        response["result"].is_array(),
-        "expected array result, got: {:?}",
+        channels.is_array(),
+        "expected channels array in result, got: {:?}",
         response["result"]
     );
 
@@ -287,9 +288,10 @@ async fn control_allowed_list_peers_returns_array() -> Result<()> {
 
     assert_eq!(response["result_type"], "list_peers");
     assert!(response["error"].is_null(), "expected no error, got: {:?}", response);
+    let peers = &response["result"]["peers"];
     assert!(
-        response["result"].is_array(),
-        "expected array result, got: {:?}",
+        peers.is_array(),
+        "expected peers array in result, got: {:?}",
         response["result"]
     );
 
