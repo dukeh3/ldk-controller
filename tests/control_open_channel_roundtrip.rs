@@ -153,7 +153,6 @@ async fn control_open_channel_then_list_channels() -> Result<()> {
     let mut control = HashMap::new();
     control.insert("open_channel".to_string(), MethodAccessRule { access_rate: None });
     control.insert("list_channels".to_string(), MethodAccessRule { access_rate: None });
-    control.insert("get_channel".to_string(), MethodAccessRule { access_rate: None });
     control.insert("close_channel".to_string(), MethodAccessRule { access_rate: None });
     let profile = UsageProfile {
         quota: None,
@@ -192,10 +191,9 @@ async fn control_open_channel_then_list_channels() -> Result<()> {
             "method": "open_channel",
             "params": {
                 "pubkey": node_b_pubkey,
-                "host": "127.0.0.1",
-                "port": port_b,
-                "capacity_sats": 2_000_000,
-                "push_msat": 1_000_000_000u64
+                "host": format!("127.0.0.1:{port_b}"),
+                "amount": 2_000_000,
+                "push_amount": 1_000_000u64
             }
         }),
     )
@@ -205,8 +203,6 @@ async fn control_open_channel_then_list_channels() -> Result<()> {
         "open_channel returned error: {:?}",
         open_response
     );
-    assert_eq!(open_response["result"]["status"], "accepted");
-
     // Confirm funding tx and wait until channel appears.
     bitcoind.mine_blocks(1, &miner_address).await;
     let channel_timeout = Duration::from_secs(40);
@@ -240,48 +236,18 @@ async fn control_open_channel_then_list_channels() -> Result<()> {
         "list_channels returned error: {:?}",
         list_response
     );
-    let channels = list_response["result"]
+    let channels = list_response["result"]["channels"]
         .as_array()
-        .expect("list_channels result should be array");
+        .expect("list_channels result.channels should be array");
     assert!(!channels.is_empty(), "expected at least one channel");
     assert!(
         channels.iter().any(|entry| {
-            entry["counterparty_pubkey"]
+            entry["peer_pubkey"]
                 .as_str()
                 .map(|pk| pk == node_b.node_id().to_string())
                 .unwrap_or(false)
         }),
         "expected channel list to contain node B"
-    );
-
-    let opened_channel_id = channels[0]["channel_id"]
-        .as_str()
-        .expect("channel_id should be string")
-        .to_string();
-
-    let get_response = send_control_request(
-        &controller,
-        &controller_secret,
-        service_pubkey,
-        json!({
-            "method": "get_channel",
-            "params": {
-                "channel_id": opened_channel_id
-            }
-        }),
-    )
-    .await?;
-    assert!(
-        get_response["error"].is_null(),
-        "get_channel returned error: {:?}",
-        get_response
-    );
-    assert!(
-        get_response["result"]["counterparty_pubkey"]
-            .as_str()
-            .map(|pk| pk == node_b.node_id().to_string())
-            .unwrap_or(false),
-        "get_channel did not return expected counterparty"
     );
 
     let close_response = send_control_request(
@@ -291,7 +257,7 @@ async fn control_open_channel_then_list_channels() -> Result<()> {
         json!({
             "method": "close_channel",
             "params": {
-                "channel_id": channels[0]["channel_id"],
+                "id": channels[0]["id"],
                 "force": true
             }
         }),
@@ -302,8 +268,6 @@ async fn control_open_channel_then_list_channels() -> Result<()> {
         "close_channel returned error: {:?}",
         close_response
     );
-    assert_eq!(close_response["result"]["status"], "accepted");
-    assert_eq!(close_response["result"]["force"], true);
 
     node_b.stop().expect("stop node B");
     ldk_service.stop().expect("stop node A service");

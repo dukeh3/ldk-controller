@@ -4,23 +4,30 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use nwc::nostr::nips::nip04;
+use nwc::nostr::nips::nip44;
 use nwc::nostr::nips::nip47::{
     CancelHoldInvoiceResponse, ErrorCode, GetBalanceResponse, GetInfoResponse,
-    LookupInvoiceResponse, MakeHoldInvoiceResponse, MakeInvoiceResponse, Method, NIP47Error,
-    PayInvoiceResponse, PayKeysendResponse, Request, RequestParams, Response, ResponseResult,
-    SettleHoldInvoiceResponse, TransactionState, TransactionType,
+    LookupInvoiceResponse, MakeHoldInvoiceResponse, MakeInvoiceResponse, MakeNewAddressResponse,
+    MakeOfferResponse, Method, NIP47Error, Notification, NotificationResult, NotificationType,
+    PayInvoiceResponse, PayKeysendResponse, PaymentNotification,
+    PayOfferResponse, PayOnchainResponse, Request, RequestParams, Response, ResponseResult,
+    SettleHoldInvoiceResponse, SubscribeNotificationsResponse, TransactionState, TransactionType,
+    LookupOfferResponse, LookupAddressResponse, AddressTransaction,
+    NncNotification, NncNotificationType, NncNotificationResult,
+    ChannelOpenedNotification, ChannelClosedNotification, PaymentMethod,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::lightning::{LdkService, LdkServiceError};
+use crate::lightning::{LdkBalance, LdkService, LdkServiceError, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
 pub mod rate_limit_rule;
 pub mod lightning;
 mod state;
 pub mod usage_profile;
 
 use crate::state::store::access_store::SharedRateState;
+use crate::state::{offer_store, address_store, subscription_store, forwarding_store};
 pub use rate_limit_rule::RateLimitRule;
 pub use state::rate_state::RateStateError;
 pub use usage_profile::get_usage_profile;
@@ -39,8 +46,8 @@ static APPLIED_GRANT_EVENTS: OnceLock<RwLock<HashMap<String, AppliedGrantEvent>>
 static FORCED_EXECUTE_FAILURES: OnceLock<RwLock<HashSet<Method>>> = OnceLock::new();
 static LDK_SERVICE: OnceLock<RwLock<Option<Arc<LdkService>>>> = OnceLock::new();
 
-pub const CONTROL_REQUEST_KIND: u16 = 23196;
-pub const CONTROL_RESPONSE_KIND: u16 = 23197;
+pub const CONTROL_REQUEST_KIND: u16 = 23198;
+pub const CONTROL_RESPONSE_KIND: u16 = 23199;
 
 #[derive(Clone)]
 struct AppliedGrantEvent {
@@ -139,6 +146,10 @@ pub fn clear_usage_profiles() {
     usage_profile::clear_all_usage_profiles_and_states();
 }
 
+pub fn clear_subscriptions() {
+    subscription_store::clear();
+}
+
 #[doc(hidden)]
 pub fn clear_access_states_for_testing() {
     usage_profile::service::clear_all_access_states();
@@ -220,7 +231,13 @@ fn verify_access(request: &Request, event: &Event) -> Result<Vec<StateUpdateRequ
             }
             match methods.get(&request.method) {
                 Some(rule) => Some(rule.clone()),
-                None => return Err(access_denied_response(&request.method)),
+                None => {
+                    // Check for "ALL" special key
+                    match methods.get(&Method::Unknown("ALL".to_string())) {
+                        Some(rule) => Some(rule.clone()),
+                        None => return Err(access_denied_response(&request.method)),
+                    }
+                }
             }
         }
     };
@@ -466,6 +483,8 @@ fn request_spend_msat(request: &Request) -> Option<u64> {
     match &request.params {
         RequestParams::PayInvoice(params) => params.amount,
         RequestParams::PayKeysend(params) => Some(params.amount),
+        RequestParams::PayOnchain(params) => Some(params.amount.saturating_mul(1000)),
+        RequestParams::PayOffer(params) => params.amount,
         _ => None,
     }
 }
@@ -542,17 +561,35 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::MakeHoldInvoice,
     Method::CancelHoldInvoice,
     Method::SettleHoldInvoice,
+    Method::PayOnchain,
+    Method::MakeNewAddress,
+    Method::PayOffer,
+    Method::MakeOffer,
+    Method::LookupOffer,
+    Method::LookupAddress,
+    Method::SubscribeNotifications,
 ];
 
+pub const CONTROL_INFO_KIND: u16 = 13198;
+
 const SUPPORTED_CONTROL_METHODS: &[&str] = &[
-    "new_onchain_address",
     "connect_peer",
     "open_channel",
     "close_channel",
     "list_channels",
-    "get_channel",
     "list_peers",
     "disconnect_peer",
+    "subscribe_notifications",
+    "get_channel_fees",
+    "set_channel_fees",
+    "list_network_nodes",
+    "get_network_node",
+    "get_network_stats",
+    "get_network_channel",
+    "get_forwarding_history",
+    "get_pending_htlcs",
+    "estimate_route_fee",
+    "query_routes",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -565,18 +602,23 @@ struct ControlRequest {
 #[derive(Debug, Clone, Deserialize)]
 struct OpenChannelParams {
     pubkey: String,
-    host: String,
-    port: u16,
-    capacity_sats: u64,
     #[serde(default)]
-    push_msat: Option<u64>,
+    host: Option<String>,
+    amount: u64,
+    #[serde(default)]
+    push_amount: Option<u64>,
+    #[serde(default)]
+    private: Option<bool>,
+    #[serde(default)]
+    close_address: Option<String>,
+    #[serde(default)]
+    notify: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ConnectPeerParams {
     pubkey: String,
     host: String,
-    port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -585,15 +627,14 @@ struct DisconnectPeerParams {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct GetChannelParams {
-    channel_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct CloseChannelParams {
-    channel_id: String,
+    id: String,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    close_address: Option<String>,
+    #[serde(default)]
+    notify: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -623,14 +664,23 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
     client.add_relay(relay_url).await?;
     client.connect().await;
 
-    // Publish capabilities (Kind 13194) — space-separated list of supported methods
+    // Publish NWC capabilities (Kind 13194) — space-separated list of supported methods
     let methods_str: String = SUPPORTED_METHODS
         .iter()
         .map(|m| m.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    let info_event = EventBuilder::new(Kind::WalletConnectInfo, methods_str);
+    let info_event = EventBuilder::new(Kind::WalletConnectInfo, methods_str)
+        .tag(Tag::parse(["encryption", "nip44_v2 nip04"]).unwrap())
+        .tag(Tag::parse(["notifications", "payment_received payment_sent hold_invoice_accepted"]).unwrap());
     client.send_event_builder(info_event).await?;
+
+    // Publish NNC capabilities (Kind 13198) — space-separated list of supported control methods
+    let control_methods_str: String = SUPPORTED_CONTROL_METHODS.join(" ");
+    let nnc_info_event = EventBuilder::new(Kind::Custom(CONTROL_INFO_KIND), control_methods_str)
+        .tag(Tag::parse(["encryption", "nip44_v2 nip04"]).unwrap())
+        .tag(Tag::parse(["notifications", "channel_opened channel_closed"]).unwrap());
+    client.send_event_builder(nnc_info_event).await?;
 
     let our_pubkey = keys.public_key();
 
@@ -731,8 +781,106 @@ pub async fn run_nwc_service_with_ldk(
     relay_url: &str,
     ldk_service: Arc<LdkService>,
 ) -> Result<Client> {
-    set_ldk_service(ldk_service);
-    run_nwc_service(keys, relay_url).await
+    set_ldk_service(ldk_service.clone());
+    let client = run_nwc_service(keys.clone(), relay_url).await?;
+
+    // Spawn LDK event loop for notification publishing
+    let event_client = client.clone();
+    let event_keys = keys.clone();
+    let event_ldk = ldk_service;
+    tokio::spawn(async move {
+        loop {
+            let event = event_ldk.node().next_event_async().await;
+            if let Err(e) = handle_ldk_event(&event_client, &event_keys, &event_ldk, &event).await
+            {
+                eprintln!("Failed to handle LDK event: {e}");
+            }
+            if let Err(e) = event_ldk.node().event_handled() {
+                eprintln!("Failed to mark event handled: {e}");
+            }
+        }
+    });
+
+    Ok(client)
+}
+
+fn payment_hash_from_kind(kind: &PaymentKind) -> Option<String> {
+    match kind {
+        PaymentKind::Bolt11 { hash, .. } => Some(hex_payment_hash(&hash.0)),
+        PaymentKind::Bolt11Jit { hash, .. } => Some(hex_payment_hash(&hash.0)),
+        PaymentKind::Spontaneous { hash, .. } => Some(hex_payment_hash(&hash.0)),
+        PaymentKind::Bolt12Offer { hash, .. } => hash.as_ref().map(|h| hex_payment_hash(&h.0)),
+        PaymentKind::Bolt12Refund { hash, .. } => hash.as_ref().map(|h| hex_payment_hash(&h.0)),
+        _ => None,
+    }
+}
+
+fn preimage_from_kind(kind: &PaymentKind) -> Option<String> {
+    match kind {
+        PaymentKind::Bolt11 { preimage, .. } => preimage.as_ref().map(|p| hex_payment_hash(&p.0)),
+        PaymentKind::Bolt11Jit { preimage, .. } => preimage.as_ref().map(|p| hex_payment_hash(&p.0)),
+        PaymentKind::Spontaneous { preimage, .. } => preimage.as_ref().map(|p| hex_payment_hash(&p.0)),
+        PaymentKind::Bolt12Offer { preimage, .. } => preimage.as_ref().map(|p| hex_payment_hash(&p.0)),
+        PaymentKind::Bolt12Refund { preimage, .. } => preimage.as_ref().map(|p| hex_payment_hash(&p.0)),
+        _ => None,
+    }
+}
+
+fn payment_method_from_kind(kind: &PaymentKind) -> Option<PaymentMethod> {
+    match kind {
+        PaymentKind::Bolt11 { .. } | PaymentKind::Bolt11Jit { .. } => Some(PaymentMethod::Bolt11),
+        PaymentKind::Bolt12Offer { .. } | PaymentKind::Bolt12Refund { .. } => Some(PaymentMethod::Bolt12),
+        PaymentKind::Spontaneous { .. } => Some(PaymentMethod::Keysend),
+        _ => None,
+    }
+}
+
+fn hex_payment_hash(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{:02x}", b);
+    }
+    out
+}
+
+fn payment_details_to_lookup_invoice_response(payment: &PaymentDetails) -> LookupInvoiceResponse {
+    let transaction_type = match payment.direction {
+        PaymentDirection::Inbound => Some(TransactionType::Incoming),
+        PaymentDirection::Outbound => Some(TransactionType::Outgoing),
+    };
+
+    let state = match payment.status {
+        PaymentStatus::Pending => Some(TransactionState::Pending),
+        PaymentStatus::Succeeded => Some(TransactionState::Settled),
+        PaymentStatus::Failed => Some(TransactionState::Failed),
+    };
+
+    let payment_hash = payment_hash_from_kind(&payment.kind).unwrap_or_default();
+    let preimage = preimage_from_kind(&payment.kind);
+
+    let settled_at = if payment.status == PaymentStatus::Succeeded {
+        Some(Timestamp::from(payment.latest_update_timestamp))
+    } else {
+        None
+    };
+
+    LookupInvoiceResponse {
+        transaction_type,
+        state,
+        invoice: None,
+        description: None,
+        description_hash: None,
+        preimage,
+        payment_hash,
+        amount: payment.amount_msat.unwrap_or(0),
+        fees_paid: payment.fee_paid_msat.unwrap_or(0),
+        created_at: Timestamp::from(payment.latest_update_timestamp),
+        expires_at: None,
+        settled_at,
+        metadata: None,
+        payment_method: payment_method_from_kind(&payment.kind),
+    }
 }
 
 trait Handler: Send + Sync {
@@ -755,12 +903,17 @@ impl Handler for GetInfoHandler {
 
     fn execute(&self, _req: &Request, caller_pubkey: &str) -> Result<Response, NIP47Error> {
         let methods = allowed_methods_for(caller_pubkey);
-        let (pubkey, network) = if let Some(ldk_service) = get_ldk_service() {
-            (ldk_service.node_id(), ldk_service.network().to_string())
+        let (pubkey, network, block_height) = if let Some(ldk_service) = get_ldk_service() {
+            (
+                ldk_service.node_id(),
+                ldk_service.network().to_string(),
+                ldk_service.status().latest_best_block_height,
+            )
         } else {
             (
                 GLOBAL_KEYS.get().unwrap().public_key().to_string(),
                 "regtest".to_string(),
+                0u32,
             )
         };
         Ok(Response {
@@ -771,10 +924,18 @@ impl Handler for GetInfoHandler {
                 color: None,
                 pubkey: Some(pubkey),
                 network: Some(network),
-                block_height: Some(0),
+                block_height: Some(block_height),
                 block_hash: None,
                 methods,
-                notifications: vec![],
+                notifications: if get_ldk_service().is_some() {
+                    vec![
+                        "payment_received".into(),
+                        "payment_sent".into(),
+                        "hold_invoice_accepted".into(),
+                    ]
+                } else {
+                    vec![]
+                },
             })),
         })
     }
@@ -794,24 +955,26 @@ impl Handler for GetBalanceHandler {
     }
 
     fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
-        let balance = if let Some(ldk_service) = get_ldk_service() {
+        let bal = if let Some(ldk_service) = get_ldk_service() {
             ldk_service.sync_wallets().map_err(|e| NIP47Error {
                 code: ErrorCode::Other,
                 message: format!("ldk sync failed: {e}"),
             })?;
-            ldk_service.get_balance_msat().map_err(|e| NIP47Error {
+            ldk_service.get_balance().map_err(|e| NIP47Error {
                 code: ErrorCode::Other,
                 message: format!("ldk balance failed: {e}"),
             })?
         } else {
-            0
+            LdkBalance { total_msat: 0, lightning_msat: 0, onchain_msat: 0 }
         };
 
         Ok(Response {
             result_type: Method::GetBalance,
             error: None,
             result: Some(ResponseResult::GetBalance(GetBalanceResponse {
-                balance,
+                balance: bal.total_msat,
+                lightning_balance: Some(bal.lightning_msat),
+                onchain_balance: Some(bal.onchain_msat),
             })),
         })
     }
@@ -1012,7 +1175,43 @@ impl Handler for LookupInvoiceHandler {
         })
     }
 
-    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let Some(ldk_service) = get_ldk_service() {
+            if let RequestParams::LookupInvoice(params) = &req.params {
+                let payment = if let Some(invoice) = &params.invoice {
+                    ldk_service.lookup_payment_by_bolt11(invoice)
+                } else if let Some(hash) = &params.payment_hash {
+                    ldk_service.lookup_payment_by_hash(hash)
+                } else {
+                    return Err(NIP47Error {
+                        code: ErrorCode::Other,
+                        message: "payment_hash or invoice is required".to_string(),
+                    });
+                };
+
+                match payment {
+                    Ok(details) => {
+                        let response = payment_details_to_lookup_invoice_response(&details);
+                        return Ok(Response {
+                            result_type: Method::LookupInvoice,
+                            error: None,
+                            result: Some(ResponseResult::LookupInvoice(response)),
+                        });
+                    }
+                    Err(LdkServiceError::PaymentNotFound(msg)) => {
+                        return Err(NIP47Error {
+                            code: ErrorCode::NotFound,
+                            message: format!("payment not found: {msg}"),
+                        });
+                    }
+                    Err(e) => {
+                        return Err(map_ldk_service_error("lookup_invoice", ErrorCode::Other, e));
+                    }
+                }
+            }
+        }
+
+        // Fallback stub when no LDK service is available
         Ok(Response {
             result_type: Method::LookupInvoice,
             error: None,
@@ -1030,6 +1229,7 @@ impl Handler for LookupInvoiceHandler {
                 expires_at: None,
                 settled_at: None,
                 metadata: None,
+                payment_method: None,
             })),
         })
     }
@@ -1049,7 +1249,38 @@ impl Handler for ListTransactionsHandler {
         })
     }
 
-    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let Some(ldk_service) = get_ldk_service() {
+            if let RequestParams::ListTransactions(params) = &req.params {
+                let direction = params.transaction_type.map(|tt| match tt {
+                    TransactionType::Incoming => PaymentDirection::Inbound,
+                    TransactionType::Outgoing => PaymentDirection::Outbound,
+                });
+
+                let payments = ldk_service.list_payments_filtered(
+                    params.from.map(|t| t.as_secs()),
+                    params.until.map(|t| t.as_secs()),
+                    params.limit,
+                    params.offset,
+                    params.unpaid,
+                    direction,
+                    params.payment_method,
+                );
+
+                let transactions: Vec<LookupInvoiceResponse> = payments
+                    .iter()
+                    .map(payment_details_to_lookup_invoice_response)
+                    .collect();
+
+                return Ok(Response {
+                    result_type: Method::ListTransactions,
+                    error: None,
+                    result: Some(ResponseResult::ListTransactions(transactions)),
+                });
+            }
+        }
+
+        // Fallback stub when no LDK service is available
         Ok(Response {
             result_type: Method::ListTransactions,
             error: None,
@@ -1165,6 +1396,304 @@ impl Handler for SettleHoldInvoiceHandler {
     }
 }
 
+struct MakeNewAddressHandler;
+
+impl Handler for MakeNewAddressHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if req.params != RequestParams::MakeNewAddress {
+            return Err(NIP47Error {
+                code: ErrorCode::Other,
+                message: "invalid params for make_new_address".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let ldk_service = get_ldk_service().ok_or_else(|| NIP47Error {
+            code: ErrorCode::Other,
+            message: "ldk service unavailable".to_string(),
+        })?;
+
+        let address = ldk_service
+            .new_onchain_address()
+            .map_err(|e| map_ldk_service_error("make_new_address", ErrorCode::Other, e))?;
+
+        // Track the address in the address store
+        address_store::register_address(address.clone());
+
+        Ok(Response {
+            result_type: Method::MakeNewAddress,
+            error: None,
+            result: Some(ResponseResult::MakeNewAddress(MakeNewAddressResponse {
+                address,
+            })),
+        })
+    }
+}
+
+struct PayOnchainHandler;
+
+impl Handler for PayOnchainHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::PayOnchain(params) = &req.params {
+            if params.address.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "address is required".to_string(),
+                });
+            }
+            if params.amount == 0 {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "amount must be greater than 0".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for pay_onchain".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let ldk_service = get_ldk_service().ok_or_else(|| NIP47Error {
+            code: ErrorCode::Other,
+            message: "ldk service unavailable".to_string(),
+        })?;
+
+        if let RequestParams::PayOnchain(params) = &req.params {
+            let txid = ldk_service
+                .pay_onchain(&params.address, params.amount, params.feerate)
+                .map_err(|e| map_ldk_service_error("pay_onchain", ErrorCode::PaymentFailed, e))?;
+
+            return Ok(Response {
+                result_type: Method::PayOnchain,
+                error: None,
+                result: Some(ResponseResult::PayOnchain(PayOnchainResponse { txid })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for pay_onchain".to_string(),
+        })
+    }
+}
+
+struct MakeOfferHandler;
+
+impl Handler for MakeOfferHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::MakeOffer(params) = &req.params {
+            if params.amount == 0 {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "amount must be greater than 0".to_string(),
+                });
+            }
+            if params.description.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "description is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for make_offer".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let ldk_service = get_ldk_service().ok_or_else(|| NIP47Error {
+            code: ErrorCode::Other,
+            message: "ldk service unavailable".to_string(),
+        })?;
+
+        if let RequestParams::MakeOffer(params) = &req.params {
+            let offer_str = ldk_service
+                .make_offer(params.amount, &params.description, params.expiry)
+                .map_err(|e| map_ldk_service_error("make_offer", ErrorCode::Other, e))?;
+
+            // Track the offer in the offer store
+            offer_store::insert_offer(offer_str.clone(), params.description.clone(), params.amount);
+
+            return Ok(Response {
+                result_type: Method::MakeOffer,
+                error: None,
+                result: Some(ResponseResult::MakeOffer(MakeOfferResponse {
+                    offer: offer_str,
+                    description: Some(params.description.clone()),
+                    amount: Some(params.amount),
+                })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for make_offer".to_string(),
+        })
+    }
+}
+
+struct PayOfferHandler;
+
+impl Handler for PayOfferHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::PayOffer(params) = &req.params {
+            if params.offer.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "offer is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for pay_offer".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let ldk_service = get_ldk_service().ok_or_else(|| NIP47Error {
+            code: ErrorCode::Other,
+            message: "ldk service unavailable".to_string(),
+        })?;
+
+        if let RequestParams::PayOffer(params) = &req.params {
+            let payment = ldk_service
+                .pay_offer(&params.offer, params.amount, params.payer_note.clone())
+                .map_err(|e| map_ldk_service_error("pay_offer", ErrorCode::PaymentFailed, e))?;
+
+            return Ok(Response {
+                result_type: Method::PayOffer,
+                error: None,
+                result: Some(ResponseResult::PayOffer(PayOfferResponse {
+                    preimage: Some(payment.preimage),
+                    fees_paid: payment.fees_paid_msat,
+                })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for pay_offer".to_string(),
+        })
+    }
+}
+
+struct LookupOfferHandler;
+
+impl Handler for LookupOfferHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::LookupOffer(params) = &req.params {
+            if params.offer.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "offer is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for lookup_offer".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let RequestParams::LookupOffer(params) = &req.params {
+            let record = offer_store::get_offer(&params.offer).ok_or_else(|| NIP47Error {
+                code: ErrorCode::NotFound,
+                message: format!("offer not found: {}", params.offer),
+            })?;
+
+            return Ok(Response {
+                result_type: Method::LookupOffer,
+                error: None,
+                result: Some(ResponseResult::LookupOffer(LookupOfferResponse {
+                    offer: record.offer,
+                    description: Some(record.description),
+                    amount: Some(record.amount_msat),
+                    active: record.active,
+                    num_payments_received: record.num_payments_received,
+                    total_received: record.total_received_msat,
+                })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for lookup_offer".to_string(),
+        })
+    }
+}
+
+struct LookupAddressHandler;
+
+impl Handler for LookupAddressHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::LookupAddress(params) = &req.params {
+            if params.address.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "address is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for lookup_address".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let RequestParams::LookupAddress(params) = &req.params {
+            let record = address_store::get_address(&params.address).ok_or_else(|| NIP47Error {
+                code: ErrorCode::NotFound,
+                message: format!("address not found: {}", params.address),
+            })?;
+
+            let transactions: Vec<AddressTransaction> = record
+                .transactions
+                .iter()
+                .map(|tx| AddressTransaction {
+                    txid: tx.txid.clone(),
+                    amount: tx.amount_sats,
+                    timestamp: Timestamp::from(tx.timestamp),
+                })
+                .collect();
+
+            let total_received: u64 = record.transactions.iter().map(|tx| tx.amount_sats).sum();
+
+            return Ok(Response {
+                result_type: Method::LookupAddress,
+                error: None,
+                result: Some(ResponseResult::LookupAddress(LookupAddressResponse {
+                    address: record.address,
+                    total_received,
+                    transactions,
+                })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for lookup_address".to_string(),
+        })
+    }
+}
+
 // Lazily initialize a static handler map to avoid rebuilding it per request.
 fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
     static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
@@ -1187,9 +1716,28 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
             Method::SettleHoldInvoice,
             Box::new(SettleHoldInvoiceHandler),
         );
+        handlers.insert(Method::MakeNewAddress, Box::new(MakeNewAddressHandler));
+        handlers.insert(Method::PayOnchain, Box::new(PayOnchainHandler));
+        handlers.insert(Method::MakeOffer, Box::new(MakeOfferHandler));
+        handlers.insert(Method::PayOffer, Box::new(PayOfferHandler));
+        handlers.insert(Method::LookupOffer, Box::new(LookupOfferHandler));
+        handlers.insert(Method::LookupAddress, Box::new(LookupAddressHandler));
         handlers
     })
 }
+
+/// Known NWC notification types for subscribe_notifications validation.
+const KNOWN_NWC_NOTIFICATION_TYPES: &[&str] = &[
+    "payment_received",
+    "payment_sent",
+    "hold_invoice_accepted",
+];
+
+/// Known NNC notification types for subscribe_notifications validation.
+const KNOWN_NNC_NOTIFICATION_TYPES: &[&str] = &[
+    "channel_opened",
+    "channel_closed",
+];
 
 async fn process_nwc_request(request: Request, event: &Event) -> Response {
     // Check that the user is authorized
@@ -1197,6 +1745,12 @@ async fn process_nwc_request(request: Request, event: &Event) -> Response {
         Ok(state_updates) => state_updates,
         Err(response) => return response,
     };
+
+    // Handle subscribe_notifications specially since it needs the caller pubkey
+    // for subscription management and doesn't follow the normal handler pattern.
+    if request.method == Method::SubscribeNotifications {
+        return handle_nwc_subscribe_notifications(&request, event);
+    }
 
     // Check that we support the requested method
     if !request_handlers().contains_key(&request.method) {
@@ -1270,6 +1824,8 @@ fn allowed_methods_for(caller_pubkey: &str) -> Vec<Method> {
         Some(methods) => {
             if methods.is_empty() {
                 Vec::new()
+            } else if methods.contains_key(&Method::Unknown("ALL".to_string())) {
+                SUPPORTED_METHODS.to_vec()
             } else {
                 SUPPORTED_METHODS
                     .iter()
@@ -1281,28 +1837,95 @@ fn allowed_methods_for(caller_pubkey: &str) -> Vec<Method> {
     }
 }
 
+// ── NIP-44 encryption helpers ────────────────────────────────────────────────
+
+/// Extract the encryption scheme from an event's `["encryption", ...]` tag.
+/// Returns `"nip04"` when no encryption tag is present (backward compat).
+fn get_encryption_scheme(event: &Event) -> &str {
+    event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        if parts.first().map(|v| v.as_str()) == Some("encryption") {
+            parts.get(1).map(|v| v.as_str())
+        } else {
+            None
+        }
+    }).unwrap_or("nip04")
+}
+
+fn decrypt_content(
+    secret_key: &SecretKey,
+    pubkey: &PublicKey,
+    content: &str,
+    scheme: &str,
+) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    match scheme {
+        "nip44_v2" => Ok(nip44::decrypt(secret_key, pubkey, content)?),
+        "nip04" => Ok(nip04::decrypt(secret_key, pubkey, content)?),
+        other => Err(format!("unsupported encryption: {other}").into()),
+    }
+}
+
+fn encrypt_content(
+    secret_key: &SecretKey,
+    pubkey: &PublicKey,
+    content: &str,
+    scheme: &str,
+) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    match scheme {
+        "nip44_v2" => Ok(nip44::encrypt(secret_key, pubkey, content, nip44::Version::V2)?),
+        "nip04" => Ok(nip04::encrypt(secret_key, pubkey, content)?),
+        other => Err(format!("unsupported encryption: {other}").into()),
+    }
+}
+
 async fn handle_nwc_request(
     client: &Client,
     keys: &Keys,
     event: &Event,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sender_pubkey = event.pubkey;
+    let scheme = get_encryption_scheme(event);
 
-    // Decrypt the NIP-04 encrypted request content
-    let decrypted = nip04::decrypt(keys.secret_key(), &sender_pubkey, &event.content)?;
+    // Return UNSUPPORTED_ENCRYPTION for unknown schemes
+    if scheme != "nip04" && scheme != "nip44_v2" {
+        let error_response = Response {
+            result_type: Method::GetInfo,
+            error: Some(NIP47Error {
+                code: ErrorCode::UnsupportedEncryption,
+                message: format!("unsupported encryption: {scheme}"),
+            }),
+            result: None,
+        };
+        // Fall back to NIP-04 for the error response since we can't use the unknown scheme
+        let encrypted = nip04::encrypt(
+            keys.secret_key(),
+            &sender_pubkey,
+            error_response.as_json(),
+        )?;
+        let response_event = EventBuilder::new(Kind::WalletConnectResponse, encrypted)
+            .tag(Tag::public_key(sender_pubkey))
+            .tag(Tag::event(event.id));
+        client.send_event_builder(response_event).await?;
+        return Ok(());
+    }
+
+    let decrypted = decrypt_content(keys.secret_key(), &sender_pubkey, &event.content, scheme)?;
 
     let request = Request::from_json(&decrypted)?;
 
     let response = process_nwc_request(request, event).await;
 
-    // Encrypt the response for the sender
+    // Encrypt the response using the same scheme the client used
     let response_json = response.as_json();
-    let encrypted = nip04::encrypt(keys.secret_key(), &sender_pubkey, response_json)?;
+    let encrypted = encrypt_content(keys.secret_key(), &sender_pubkey, &response_json, scheme)?;
 
     // Build and send the response event (Kind 23195)
-    let response_event = EventBuilder::new(Kind::WalletConnectResponse, encrypted)
+    let mut response_event = EventBuilder::new(Kind::WalletConnectResponse, encrypted)
         .tag(Tag::public_key(sender_pubkey))
         .tag(Tag::event(event.id));
+    if scheme != "nip04" {
+        response_event = response_event.tag(Tag::parse(["encryption", scheme]).unwrap());
+    }
 
     client.send_event_builder(response_event).await?;
 
@@ -1327,7 +1950,9 @@ fn authorize_control_method(caller_pubkey: &str, method: &str) -> Result<(), Con
         ));
     };
 
-    if control_methods.is_empty() || !control_methods.contains_key(method) {
+    if control_methods.is_empty()
+        || (!control_methods.contains_key(method) && !control_methods.contains_key("ALL"))
+    {
         return Err(control_error(
             "RESTRICTED",
             "control access denied, insufficient permission".to_string(),
@@ -1376,13 +2001,13 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
                 };
             }
         };
-        if params.capacity_sats == 0 {
+        if params.amount == 0 {
             return ControlResponse {
                 result_type: "open_channel".to_string(),
                 result: None,
                 error: Some(control_error(
                     "OTHER",
-                    "capacity_sats must be greater than 0".to_string(),
+                    "amount must be greater than 0".to_string(),
                 )),
             };
         }
@@ -1397,12 +2022,13 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
             };
         };
 
-        let address = format!("{}:{}", params.host, params.port);
+        let push_msat = params.push_amount.map(|sats| sats * 1000);
+        let address = params.host.as_deref().unwrap_or("");
         if let Err(e) = ldk_service.open_channel(
             &params.pubkey,
-            &address,
-            params.capacity_sats,
-            params.push_msat,
+            address,
+            params.amount,
+            push_msat,
         ) {
             return ControlResponse {
                 result_type: "open_channel".to_string(),
@@ -1416,36 +2042,8 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
 
         return ControlResponse {
             result_type: "open_channel".to_string(),
-            result: Some(json!({ "status": "accepted" })),
+            result: Some(json!({})),
             error: None,
-        };
-    }
-
-    if request.method == "new_onchain_address" {
-        let Some(ldk_service) = get_ldk_service() else {
-            return ControlResponse {
-                result_type: "new_onchain_address".to_string(),
-                result: None,
-                error: Some(control_error(
-                    "OTHER",
-                    "ldk service unavailable".to_string(),
-                )),
-            };
-        };
-        return match ldk_service.new_onchain_address() {
-            Ok(address) => ControlResponse {
-                result_type: "new_onchain_address".to_string(),
-                result: Some(json!({ "address": address })),
-                error: None,
-            },
-            Err(e) => ControlResponse {
-                result_type: "new_onchain_address".to_string(),
-                result: None,
-                error: Some(control_error(
-                    "OTHER",
-                    format!("new_onchain_address failed: {e}"),
-                )),
-            },
         };
     }
 
@@ -1473,8 +2071,7 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
                 )),
             };
         };
-        let address = format!("{}:{}", params.host, params.port);
-        if let Err(e) = ldk_service.connect_peer(&params.pubkey, &address) {
+        if let Err(e) = ldk_service.connect_peer(&params.pubkey, &params.host) {
             return ControlResponse {
                 result_type: "connect_peer".to_string(),
                 result: None,
@@ -1540,7 +2137,7 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
         return ControlResponse {
             result_type: request.method,
-            result: Some(serde_json::to_value(channels).unwrap_or(Value::Array(Vec::new()))),
+            result: Some(json!({ "channels": channels })),
             error: None,
         };
     }
@@ -1553,49 +2150,8 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
         return ControlResponse {
             result_type: request.method,
-            result: Some(serde_json::to_value(peers).unwrap_or(Value::Array(Vec::new()))),
+            result: Some(json!({ "peers": peers })),
             error: None,
-        };
-    }
-
-    if request.method == "get_channel" {
-        let params = match serde_json::from_value::<GetChannelParams>(request.params.clone()) {
-            Ok(params) => params,
-            Err(e) => {
-                return ControlResponse {
-                    result_type: request.method,
-                    result: None,
-                    error: Some(control_error(
-                        "OTHER",
-                        format!("invalid get_channel params: {e}"),
-                    )),
-                };
-            }
-        };
-        let Some(ldk_service) = get_ldk_service() else {
-            return ControlResponse {
-                result_type: "get_channel".to_string(),
-                result: None,
-                error: Some(control_error(
-                    "OTHER",
-                    "ldk service unavailable".to_string(),
-                )),
-            };
-        };
-        return match ldk_service.get_channel(&params.channel_id) {
-            Some(channel) => ControlResponse {
-                result_type: "get_channel".to_string(),
-                result: Some(serde_json::to_value(channel).unwrap_or(Value::Null)),
-                error: None,
-            },
-            None => ControlResponse {
-                result_type: "get_channel".to_string(),
-                result: None,
-                error: Some(control_error(
-                    "NOT_FOUND",
-                    format!("channel not found: {}", params.channel_id),
-                )),
-            },
         };
     }
 
@@ -1623,7 +2179,7 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
                 )),
             };
         };
-        if let Err(e) = ldk_service.close_channel(&params.channel_id, params.force) {
+        if let Err(e) = ldk_service.close_channel(&params.id, params.force) {
             return ControlResponse {
                 result_type: "close_channel".to_string(),
                 result: None,
@@ -1635,7 +2191,347 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         }
         return ControlResponse {
             result_type: "close_channel".to_string(),
-            result: Some(json!({ "status": "accepted", "force": params.force })),
+            result: Some(json!({})),
+            error: None,
+        };
+    }
+
+    if request.method == "get_channel_fees" {
+        #[derive(Deserialize)]
+        struct GetChannelFeesParams {
+            #[serde(default)]
+            id: Option<String>,
+        }
+        let params = match serde_json::from_value::<GetChannelFeesParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid get_channel_fees params: {e}"),
+                    )),
+                };
+            }
+        };
+        let fees = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.get_channel_fees(params.id.as_deref())
+        } else {
+            Vec::new()
+        };
+        return ControlResponse {
+            result_type: "get_channel_fees".to_string(),
+            result: Some(json!({ "fees": fees })),
+            error: None,
+        };
+    }
+
+    if request.method == "set_channel_fees" {
+        #[derive(Deserialize)]
+        struct SetChannelFeesParams {
+            id: String,
+            #[serde(default)]
+            base_fee_msat: Option<u32>,
+            #[serde(default)]
+            fee_rate: Option<u32>,
+        }
+        let params = match serde_json::from_value::<SetChannelFeesParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid set_channel_fees params: {e}"),
+                    )),
+                };
+            }
+        };
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "set_channel_fees".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "ldk service unavailable".to_string(),
+                )),
+            };
+        };
+        if let Err(e) = ldk_service.set_channel_fees(
+            &params.id,
+            params.base_fee_msat,
+            params.fee_rate,
+        ) {
+            return ControlResponse {
+                result_type: "set_channel_fees".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    format!("set_channel_fees failed: {e}"),
+                )),
+            };
+        }
+        return ControlResponse {
+            result_type: "set_channel_fees".to_string(),
+            result: Some(json!({})),
+            error: None,
+        };
+    }
+
+    if request.method == "list_network_nodes" {
+        #[derive(Deserialize)]
+        struct ListNetworkNodesParams {
+            #[serde(default = "default_limit")]
+            limit: usize,
+            #[serde(default)]
+            offset: usize,
+        }
+        fn default_limit() -> usize { 100 }
+        let params = match serde_json::from_value::<ListNetworkNodesParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid list_network_nodes params: {e}"),
+                    )),
+                };
+            }
+        };
+        let nodes = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.list_network_nodes(params.limit, params.offset)
+        } else {
+            Vec::new()
+        };
+        return ControlResponse {
+            result_type: "list_network_nodes".to_string(),
+            result: Some(json!({ "nodes": nodes })),
+            error: None,
+        };
+    }
+
+    if request.method == "get_network_node" {
+        #[derive(Deserialize)]
+        struct GetNetworkNodeParams {
+            pubkey: String,
+        }
+        let params = match serde_json::from_value::<GetNetworkNodeParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid get_network_node params: {e}"),
+                    )),
+                };
+            }
+        };
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "get_network_node".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "ldk service unavailable".to_string(),
+                )),
+            };
+        };
+        match ldk_service.get_network_node(&params.pubkey) {
+            Ok(Some(node)) => {
+                return ControlResponse {
+                    result_type: "get_network_node".to_string(),
+                    result: Some(serde_json::to_value(node).unwrap()),
+                    error: None,
+                };
+            }
+            Ok(None) => {
+                return ControlResponse {
+                    result_type: "get_network_node".to_string(),
+                    result: None,
+                    error: Some(control_error(
+                        "NOT_FOUND",
+                        format!("node not found: {}", params.pubkey),
+                    )),
+                };
+            }
+            Err(e) => {
+                return ControlResponse {
+                    result_type: "get_network_node".to_string(),
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("get_network_node failed: {e}"),
+                    )),
+                };
+            }
+        }
+    }
+
+    if request.method == "get_network_stats" {
+        let stats = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.get_network_stats()
+        } else {
+            crate::lightning::NetworkStats {
+                num_nodes: 0,
+                num_channels: 0,
+                total_capacity: 0,
+                avg_channel_size: 0,
+                max_channel_size: 0,
+            }
+        };
+        return ControlResponse {
+            result_type: "get_network_stats".to_string(),
+            result: Some(serde_json::to_value(stats).unwrap()),
+            error: None,
+        };
+    }
+
+    if request.method == "get_network_channel" {
+        #[derive(Deserialize)]
+        struct GetNetworkChannelParams {
+            short_channel_id: String,
+        }
+        let params = match serde_json::from_value::<GetNetworkChannelParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid get_network_channel params: {e}"),
+                    )),
+                };
+            }
+        };
+        let Some(ldk_service) = get_ldk_service() else {
+            return ControlResponse {
+                result_type: "get_network_channel".to_string(),
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "ldk service unavailable".to_string(),
+                )),
+            };
+        };
+        match ldk_service.get_network_channel(&params.short_channel_id) {
+            Ok(Some(channel)) => {
+                return ControlResponse {
+                    result_type: "get_network_channel".to_string(),
+                    result: Some(serde_json::to_value(channel).unwrap()),
+                    error: None,
+                };
+            }
+            Ok(None) => {
+                return ControlResponse {
+                    result_type: "get_network_channel".to_string(),
+                    result: None,
+                    error: Some(control_error(
+                        "NOT_FOUND",
+                        format!("channel not found: {}", params.short_channel_id),
+                    )),
+                };
+            }
+            Err(e) => {
+                return ControlResponse {
+                    result_type: "get_network_channel".to_string(),
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("get_network_channel failed: {e}"),
+                    )),
+                };
+            }
+        }
+    }
+
+    if request.method == "get_forwarding_history" {
+        #[derive(Deserialize)]
+        struct GetForwardingHistoryParams {
+            #[serde(default)]
+            from: Option<u64>,
+            #[serde(default)]
+            until: Option<u64>,
+            #[serde(default = "default_fwd_limit")]
+            limit: usize,
+            #[serde(default)]
+            offset: usize,
+        }
+        fn default_fwd_limit() -> usize { 100 }
+        let params = match serde_json::from_value::<GetForwardingHistoryParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid get_forwarding_history params: {e}"),
+                    )),
+                };
+            }
+        };
+        let forwards = forwarding_store::get_history(
+            params.from,
+            params.until,
+            params.limit,
+            params.offset,
+        );
+        return ControlResponse {
+            result_type: "get_forwarding_history".to_string(),
+            result: Some(json!({ "forwards": forwards })),
+            error: None,
+        };
+    }
+
+    if request.method == "subscribe_notifications" {
+        #[derive(Deserialize)]
+        struct SubscribeParams {
+            types: Vec<String>,
+        }
+        let params = match serde_json::from_value::<SubscribeParams>(request.params.clone()) {
+            Ok(params) => params,
+            Err(e) => {
+                return ControlResponse {
+                    result_type: request.method,
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("invalid subscribe_notifications params: {e}"),
+                    )),
+                };
+            }
+        };
+
+        // Validate that all requested types are known NNC notification types
+        for t in &params.types {
+            if !KNOWN_NNC_NOTIFICATION_TYPES.contains(&t.as_str()) {
+                return ControlResponse {
+                    result_type: "subscribe_notifications".to_string(),
+                    result: None,
+                    error: Some(control_error(
+                        "OTHER",
+                        format!("unknown notification type: {t}"),
+                    )),
+                };
+            }
+        }
+
+        if params.types.is_empty() {
+            subscription_store::unsubscribe(caller_pubkey);
+        } else {
+            subscription_store::subscribe(caller_pubkey, &params.types);
+        }
+
+        return ControlResponse {
+            result_type: "subscribe_notifications".to_string(),
+            result: Some(json!({})),
             error: None,
         };
     }
@@ -1650,13 +2546,81 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
     }
 }
 
+fn handle_nwc_subscribe_notifications(request: &Request, event: &Event) -> Response {
+    let caller_pubkey = event.pubkey.to_string();
+
+    if let RequestParams::SubscribeNotifications(params) = &request.params {
+        // Validate that all requested types are known NWC notification types
+        for t in &params.types {
+            if !KNOWN_NWC_NOTIFICATION_TYPES.contains(&t.as_str()) {
+                return Response {
+                    result_type: Method::SubscribeNotifications,
+                    error: Some(NIP47Error {
+                        code: ErrorCode::Other,
+                        message: format!("unknown notification type: {t}"),
+                    }),
+                    result: None,
+                };
+            }
+        }
+
+        if params.types.is_empty() {
+            // Empty types list means unsubscribe
+            subscription_store::unsubscribe(&caller_pubkey);
+        } else {
+            subscription_store::subscribe(&caller_pubkey, &params.types);
+        }
+
+        return Response {
+            result_type: Method::SubscribeNotifications,
+            error: None,
+            result: Some(ResponseResult::SubscribeNotifications(
+                SubscribeNotificationsResponse {},
+            )),
+        };
+    }
+
+    Response {
+        result_type: Method::SubscribeNotifications,
+        error: Some(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for subscribe_notifications".to_string(),
+        }),
+        result: None,
+    }
+}
+
 async fn handle_control_request(
     client: &Client,
     keys: &Keys,
     event: &Event,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sender_pubkey = event.pubkey;
-    let decrypted = nip04::decrypt(keys.secret_key(), &sender_pubkey, &event.content)?;
+    let scheme = get_encryption_scheme(event);
+
+    // Return UNSUPPORTED_ENCRYPTION for unknown schemes
+    if scheme != "nip04" && scheme != "nip44_v2" {
+        let error_resp = ControlResponse {
+            result_type: "unknown".to_string(),
+            result: None,
+            error: Some(control_error(
+                "UNSUPPORTED_ENCRYPTION",
+                format!("unsupported encryption: {scheme}"),
+            )),
+        };
+        let encrypted = nip04::encrypt(
+            keys.secret_key(),
+            &sender_pubkey,
+            serde_json::to_string(&error_resp)?,
+        )?;
+        let response_event = EventBuilder::new(Kind::Custom(CONTROL_RESPONSE_KIND), encrypted)
+            .tag(Tag::public_key(sender_pubkey))
+            .tag(Tag::event(event.id));
+        client.send_event_builder(response_event).await?;
+        return Ok(());
+    }
+
+    let decrypted = decrypt_content(keys.secret_key(), &sender_pubkey, &event.content, scheme)?;
 
     let response = match serde_json::from_str::<ControlRequest>(&decrypted) {
         Ok(request) => process_control_request(request, &sender_pubkey.to_string()),
@@ -1671,10 +2635,308 @@ async fn handle_control_request(
     };
 
     let response_json = serde_json::to_string(&response)?;
-    let encrypted = nip04::encrypt(keys.secret_key(), &sender_pubkey, response_json)?;
-    let response_event = EventBuilder::new(Kind::Custom(CONTROL_RESPONSE_KIND), encrypted)
+    let encrypted = encrypt_content(keys.secret_key(), &sender_pubkey, &response_json, scheme)?;
+    let mut response_event = EventBuilder::new(Kind::Custom(CONTROL_RESPONSE_KIND), encrypted)
         .tag(Tag::public_key(sender_pubkey))
         .tag(Tag::event(event.id));
+    if scheme != "nip04" {
+        response_event = response_event.tag(Tag::parse(["encryption", scheme]).unwrap());
+    }
     client.send_event_builder(response_event).await?;
+    Ok(())
+}
+
+// ── LDK Event Loop ──────────────────────────────────────────────────────────
+
+/// Kind 23196 — NWC wallet notification (NIP-04)
+const NWC_NOTIFICATION_KIND_NIP04: u16 = 23196;
+/// Kind 23197 — NWC wallet notification (NIP-44)
+const NWC_NOTIFICATION_KIND_NIP44: u16 = 23197;
+/// Kind 23200 — NNC node control notification
+const NNC_NOTIFICATION_KIND: u16 = 23200;
+
+async fn handle_ldk_event(
+    client: &Client,
+    keys: &Keys,
+    ldk_service: &Arc<LdkService>,
+    event: &ldk_node::Event,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use ldk_node::Event;
+
+    match event {
+        Event::PaymentReceived {
+            payment_hash,
+            amount_msat,
+            ..
+        } => {
+            let notif = build_payment_received_notification(
+                &hex_payment_hash(&payment_hash.0),
+                *amount_msat,
+            );
+            let json = notif.as_json();
+            publish_nwc_notification(client, keys, "payment_received", &json).await?;
+        }
+        Event::PaymentSuccessful {
+            payment_hash,
+            fee_paid_msat,
+            ..
+        } => {
+            let notif = build_payment_sent_notification(
+                &hex_payment_hash(&payment_hash.0),
+                fee_paid_msat,
+            );
+            let json = notif.as_json();
+            publish_nwc_notification(client, keys, "payment_sent", &json).await?;
+        }
+        Event::PaymentClaimable {
+            payment_hash,
+            claimable_amount_msat,
+            claim_deadline,
+            ..
+        } => {
+            let notif = build_hold_invoice_accepted_notification(
+                &hex_payment_hash(&payment_hash.0),
+                *claimable_amount_msat,
+                *claim_deadline,
+            );
+            let json = notif.as_json();
+            publish_nwc_notification(client, keys, "hold_invoice_accepted", &json).await?;
+        }
+        Event::ChannelReady {
+            channel_id,
+            counterparty_node_id,
+            funding_txo,
+            ..
+        } => {
+            let notif = build_channel_opened_notification(
+                ldk_service,
+                &channel_id.to_string(),
+                counterparty_node_id.as_ref(),
+                funding_txo.as_ref(),
+            );
+            let json = notif.as_json();
+            publish_nnc_notification(client, keys, "channel_opened", &json).await?;
+        }
+        Event::ChannelClosed {
+            channel_id,
+            counterparty_node_id,
+            reason,
+            ..
+        } => {
+            let notif = build_channel_closed_notification(
+                &channel_id.to_string(),
+                counterparty_node_id.as_ref(),
+                reason.as_ref(),
+            );
+            let json = notif.as_json();
+            publish_nnc_notification(client, keys, "channel_closed", &json).await?;
+        }
+        Event::PaymentForwarded {
+            prev_channel_id,
+            next_channel_id,
+            total_fee_earned_msat,
+            outbound_amount_forwarded_msat,
+            ..
+        } => {
+            let fee = total_fee_earned_msat.unwrap_or(0);
+            let outgoing = outbound_amount_forwarded_msat.unwrap_or(0);
+            let incoming = outgoing.saturating_add(fee);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            forwarding_store::record_forward(forwarding_store::ForwardingEntry {
+                incoming_channel_id: prev_channel_id.to_string(),
+                outgoing_channel_id: next_channel_id.to_string(),
+                incoming_amount: incoming,
+                outgoing_amount: outgoing,
+                fee_earned: fee,
+                settled_at: now,
+            });
+        }
+        _ => {} // Ignore other events for now
+    }
+    Ok(())
+}
+
+// ── Notification builders ───────────────────────────────────────────────────
+
+fn build_payment_received_notification(payment_hash: &str, amount_msat: u64) -> Notification {
+    Notification {
+        notification_type: NotificationType::PaymentReceived,
+        notification: NotificationResult::PaymentReceived(PaymentNotification {
+            transaction_type: Some(TransactionType::Incoming),
+            state: Some(TransactionState::Settled),
+            invoice: String::new(),
+            description: None,
+            description_hash: None,
+            preimage: String::new(),
+            payment_hash: payment_hash.to_string(),
+            amount: amount_msat,
+            fees_paid: 0,
+            created_at: Timestamp::now(),
+            expires_at: None,
+            settled_at: Timestamp::now(),
+            metadata: None,
+        }),
+    }
+}
+
+fn build_payment_sent_notification(
+    payment_hash: &str,
+    fee_paid_msat: &Option<u64>,
+) -> Notification {
+    Notification {
+        notification_type: NotificationType::PaymentSent,
+        notification: NotificationResult::PaymentSent(PaymentNotification {
+            transaction_type: Some(TransactionType::Outgoing),
+            state: Some(TransactionState::Settled),
+            invoice: String::new(),
+            description: None,
+            description_hash: None,
+            preimage: String::new(),
+            payment_hash: payment_hash.to_string(),
+            amount: 0,
+            fees_paid: fee_paid_msat.unwrap_or(0),
+            created_at: Timestamp::now(),
+            expires_at: None,
+            settled_at: Timestamp::now(),
+            metadata: None,
+        }),
+    }
+}
+
+fn build_hold_invoice_accepted_notification(
+    payment_hash: &str,
+    claimable_amount_msat: u64,
+    claim_deadline: Option<u32>,
+) -> Notification {
+    use nwc::nostr::nips::nip47::HoldInvoiceAcceptedNotification;
+    Notification {
+        notification_type: NotificationType::HoldInvoiceAccepted,
+        notification: NotificationResult::HoldInvoiceAccepted(HoldInvoiceAcceptedNotification {
+            transaction_type: TransactionType::Incoming,
+            state: Some(TransactionState::Accepted),
+            invoice: String::new(),
+            description: None,
+            description_hash: None,
+            payment_hash: payment_hash.to_string(),
+            amount: claimable_amount_msat,
+            created_at: Timestamp::now(),
+            expires_at: Timestamp::now(),
+            settle_deadline: claim_deadline.unwrap_or(0),
+            metadata: None,
+        }),
+    }
+}
+
+fn build_channel_opened_notification(
+    ldk_service: &Arc<LdkService>,
+    channel_id: &str,
+    counterparty: Option<&ldk_node::bitcoin::secp256k1::PublicKey>,
+    funding_txo: Option<&ldk_node::bitcoin::OutPoint>,
+) -> NncNotification {
+    // Try to find the channel in the channel list for richer details
+    let channels = ldk_service.list_channels();
+    let channel = channels.iter().find(|c| c.id == channel_id);
+
+    NncNotification {
+        notification_type: NncNotificationType::ChannelOpened,
+        notification: NncNotificationResult::ChannelOpened(ChannelOpenedNotification {
+            id: channel_id.to_string(),
+            short_channel_id: channel.and_then(|c| c.short_channel_id.clone()),
+            peer_pubkey: counterparty
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            capacity: channel.map(|c| c.capacity).unwrap_or(0),
+            local_balance: channel.map(|c| c.local_balance).unwrap_or(0),
+            remote_balance: channel.map(|c| c.remote_balance).unwrap_or(0),
+            funding_txid: funding_txo
+                .map(|txo| txo.txid.to_string())
+                .unwrap_or_default(),
+            is_private: channel.map(|c| c.is_private).unwrap_or(false),
+        }),
+    }
+}
+
+fn build_channel_closed_notification(
+    channel_id: &str,
+    counterparty: Option<&ldk_node::bitcoin::secp256k1::PublicKey>,
+    reason: Option<&ldk_node::lightning::events::ClosureReason>,
+) -> NncNotification {
+    let close_type = match reason {
+        Some(ldk_node::lightning::events::ClosureReason::CounterpartyForceClosed { .. }) => {
+            "force"
+        }
+        Some(ldk_node::lightning::events::ClosureReason::HolderForceClosed { .. }) => "force",
+        Some(ldk_node::lightning::events::ClosureReason::LegacyCooperativeClosure) => {
+            "cooperative"
+        }
+        Some(ldk_node::lightning::events::ClosureReason::LocallyInitiatedCooperativeClosure) => {
+            "cooperative"
+        }
+        Some(ldk_node::lightning::events::ClosureReason::CounterpartyInitiatedCooperativeClosure) => {
+            "cooperative"
+        }
+        _ => "unknown",
+    };
+
+    NncNotification {
+        notification_type: NncNotificationType::ChannelClosed,
+        notification: NncNotificationResult::ChannelClosed(ChannelClosedNotification {
+            id: channel_id.to_string(),
+            short_channel_id: None,
+            peer_pubkey: counterparty
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            capacity: 0,
+            closing_txid: None,
+            close_type: close_type.to_string(),
+        }),
+    }
+}
+
+// ── Notification publishers ─────────────────────────────────────────────────
+
+/// Publish dual NWC notifications: Kind 23196 (NIP-04) + Kind 23197 (NIP-44).
+/// Per NIP-47 spec, wallet services supporting both schemes publish both kinds.
+async fn publish_nwc_notification(
+    client: &Client,
+    keys: &Keys,
+    notification_type: &str,
+    payload: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for sub_pubkey_hex in subscription_store::get_subscribers(notification_type) {
+        let sub_pubkey = PublicKey::from_hex(&sub_pubkey_hex)?;
+
+        // Kind 23196 — NIP-04 encrypted (backward compat)
+        let encrypted_04 = nip04::encrypt(keys.secret_key(), &sub_pubkey, payload)?;
+        let event_04 = EventBuilder::new(Kind::Custom(NWC_NOTIFICATION_KIND_NIP04), encrypted_04)
+            .tag(Tag::public_key(sub_pubkey));
+        client.send_event_builder(event_04).await?;
+
+        // Kind 23197 — NIP-44 encrypted
+        let encrypted_44 = nip44::encrypt(keys.secret_key(), &sub_pubkey, payload, nip44::Version::V2)?;
+        let event_44 = EventBuilder::new(Kind::Custom(NWC_NOTIFICATION_KIND_NIP44), encrypted_44)
+            .tag(Tag::public_key(sub_pubkey));
+        client.send_event_builder(event_44).await?;
+    }
+    Ok(())
+}
+
+/// Publish NNC notification using NIP-44 only (no legacy NIP-04 for NNC).
+async fn publish_nnc_notification(
+    client: &Client,
+    keys: &Keys,
+    notification_type: &str,
+    payload: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for sub_pubkey_hex in subscription_store::get_subscribers(notification_type) {
+        let sub_pubkey = PublicKey::from_hex(&sub_pubkey_hex)?;
+        let encrypted = nip44::encrypt(keys.secret_key(), &sub_pubkey, payload, nip44::Version::V2)?;
+        let event = EventBuilder::new(Kind::Custom(NNC_NOTIFICATION_KIND), encrypted)
+            .tag(Tag::public_key(sub_pubkey));
+        client.send_event_builder(event).await?;
+    }
     Ok(())
 }

@@ -626,8 +626,8 @@ async fn e2e_control_list_channels_roundtrip() -> Result<()> {
     assert_eq!(response["result_type"], "list_channels");
     assert!(response["error"].is_null(), "unexpected control error: {:?}", response["error"]);
     assert!(
-        response["result"].is_array(),
-        "list_channels result should be an array, got: {:?}",
+        response["result"]["channels"].is_array(),
+        "list_channels result.channels should be an array, got: {:?}",
         response["result"]
     );
 
@@ -789,15 +789,15 @@ async fn e2e_control_open_channel_and_bidirectional_payment() -> Result<()> {
         .await;
         let bob_node_id = bob.node_id();
         let alice_ready = list_response["error"].is_null()
-            && list_response["result"]
+            && list_response["result"]["channels"]
                 .as_array()
                 .map(|channels| {
                     channels.iter().any(|entry| {
-                        entry["counterparty_pubkey"]
+                        entry["peer_pubkey"]
                             .as_str()
                             .map(|pk| pk == bob_node_id)
                             .unwrap_or(false)
-                            && entry["is_channel_ready"].as_bool().unwrap_or(false)
+                            && entry["state"].as_str().map(|s| s == "active").unwrap_or(false)
                     })
                 })
                 .unwrap_or(false);
@@ -820,8 +820,7 @@ async fn e2e_control_open_channel_and_bidirectional_payment() -> Result<()> {
             "method": "connect_peer",
             "params": {
                 "pubkey": bob.node_id(),
-                "host": "127.0.0.1",
-                "port": bob_listen_port
+                "host": format!("127.0.0.1:{bob_listen_port}")
             }
         }),
     )
@@ -955,7 +954,6 @@ async fn e2e_control_alice_opens_channel_and_bidirectional_payment() -> Result<(
     methods.insert(Method::PayInvoice, MethodAccessRule { access_rate: None });
 
     let mut control = HashMap::new();
-    control.insert("new_onchain_address".to_string(), MethodAccessRule { access_rate: None });
     control.insert("open_channel".to_string(), MethodAccessRule { access_rate: None });
     control.insert("list_channels".to_string(), MethodAccessRule { access_rate: None });
     control.insert("connect_peer".to_string(), MethodAccessRule { access_rate: None });
@@ -1000,6 +998,8 @@ async fn e2e_control_alice_opens_channel_and_bidirectional_payment() -> Result<(
     let uri =
         NostrWalletConnectUri::new(service_pubkey, vec![relay], controller_secret.clone(), None);
 
+    // TODO: new_onchain_address was removed from NNC (Phase 1.10).
+    // Needs NWC MakeNewAddress (Phase 6) to fund containerized Alice.
     let funding_addr_response = send_control_request_and_wait_response(
         &nwc_client,
         &controller_secret,
@@ -1061,8 +1061,7 @@ async fn e2e_control_alice_opens_channel_and_bidirectional_payment() -> Result<(
             "method": "connect_peer",
             "params": {
                 "pubkey": bob.node_id(),
-                "host": "127.0.0.1",
-                "port": bob_listen_port
+                "host": format!("127.0.0.1:{bob_listen_port}")
             }
         }),
     )
@@ -1081,10 +1080,9 @@ async fn e2e_control_alice_opens_channel_and_bidirectional_payment() -> Result<(
             "method": "open_channel",
             "params": {
                 "pubkey": bob.node_id(),
-                "host": "127.0.0.1",
-                "port": bob_listen_port,
-                "capacity_sats": 2_000_000,
-                "push_msat": 1_000_000_000u64
+                "host": format!("127.0.0.1:{bob_listen_port}"),
+                "amount": 2_000_000,
+                "push_amount": 1_000_000u64
             }
         }),
     )
@@ -1125,15 +1123,15 @@ async fn e2e_control_alice_opens_channel_and_bidirectional_payment() -> Result<(
         )
         .await;
         let alice_ready = list_response["error"].is_null()
-            && list_response["result"]
+            && list_response["result"]["channels"]
                 .as_array()
                 .map(|channels| {
                     channels.iter().any(|entry| {
-                        entry["counterparty_pubkey"]
+                        entry["peer_pubkey"]
                             .as_str()
                             .map(|pk| pk == bob.node_id())
                             .unwrap_or(false)
-                            && entry["is_channel_ready"].as_bool().unwrap_or(false)
+                            && entry["state"].as_str().map(|s| s == "active").unwrap_or(false)
                     })
                 })
                 .unwrap_or(false);

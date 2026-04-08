@@ -216,15 +216,15 @@ async fn control_list_channels_returns_opened_channel() -> Result<()> {
         "expected no error for list_channels: {:?}",
         response
     );
-    let channels = response["result"]
+    let channels = response["result"]["channels"]
         .as_array()
-        .expect("result should be an array");
+        .expect("result.channels should be an array");
     assert!(
         !channels.is_empty(),
         "expected at least one channel in list_channels result"
     );
     let has_counterparty = channels.iter().any(|entry| {
-        entry["counterparty_pubkey"]
+        entry["peer_pubkey"]
             .as_str()
             .map(|pk| pk == node_b_pubkey)
             .unwrap_or(false)

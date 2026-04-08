@@ -170,8 +170,7 @@ async fn control_connect_then_disconnect_peer() -> Result<()> {
             "method": "connect_peer",
             "params": {
                 "pubkey": node_b_pubkey,
-                "host": "127.0.0.1",
-                "port": port_b
+                "host": format!("127.0.0.1:{port_b}")
             }
         }),
     )
@@ -194,12 +193,12 @@ async fn control_connect_then_disconnect_peer() -> Result<()> {
     )
     .await?;
     assert!(list_response["error"].is_null(), "list_peers errored: {:?}", list_response);
-    let peers = list_response["result"]
+    let peers = list_response["result"]["peers"]
         .as_array()
-        .expect("list_peers result should be array");
+        .expect("list_peers result.peers should be array");
     assert!(
         peers.iter().any(|p| {
-            p["node_id"].as_str().map(|id| id == node_b.node_id().to_string()).unwrap_or(false)
+            p["pubkey"].as_str().map(|id| id == node_b.node_id().to_string()).unwrap_or(false)
         }),
         "expected list_peers to include node B"
     );

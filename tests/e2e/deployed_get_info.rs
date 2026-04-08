@@ -53,7 +53,6 @@ async fn deployed_nwc_get_info_roundtrip() -> Result<()> {
         "quota": null,
         "methods": null,
         "control": {
-            "new_onchain_address": { "access_rate": null },
             "list_channels": { "access_rate": null },
             "connect_peer": { "access_rate": null },
             "open_channel": { "access_rate": null }

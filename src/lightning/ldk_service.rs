@@ -3,7 +3,11 @@ use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
-use ldk_node::payment::{PaymentDirection, PaymentKind, PaymentStatus};
+use ldk_node::bitcoin::Address;
+use ldk_node::lightning::offers::offer::Offer;
+use ldk_node::lightning::routing::gossip::NodeId;
+use ldk_node::payment::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
+use nwc::nostr::nips::nip47::PaymentMethod;
 use ldk_node::{Builder, Node};
 use serde::Serialize;
 use std::fmt;
@@ -99,6 +103,9 @@ pub enum LdkServiceError {
     ChannelFailed(String),
     PeerFailed(String),
     PaymentFailed(String),
+    PaymentNotFound(String),
+    InvalidAddress(String),
+    OfferFailed(String),
     StopFailed(String),
 }
 
@@ -119,12 +126,26 @@ impl fmt::Display for LdkServiceError {
             Self::ChannelFailed(msg) => write!(f, "channel operation failed: {msg}"),
             Self::PeerFailed(msg) => write!(f, "peer operation failed: {msg}"),
             Self::PaymentFailed(msg) => write!(f, "payment failed: {msg}"),
+            Self::PaymentNotFound(msg) => write!(f, "payment not found: {msg}"),
+            Self::InvalidAddress(msg) => write!(f, "invalid address: {msg}"),
+            Self::OfferFailed(msg) => write!(f, "offer operation failed: {msg}"),
             Self::StopFailed(msg) => write!(f, "ldk node stop failed: {msg}"),
         }
     }
 }
 
 impl std::error::Error for LdkServiceError {}
+
+#[derive(Debug, Clone)]
+pub struct LdkBalance {
+    pub total_msat: u64,
+    pub lightning_msat: u64,
+    pub onchain_msat: u64,
+}
+
+pub struct LdkNodeStatus {
+    pub latest_best_block_height: u32,
+}
 
 pub struct LdkService {
     node: Arc<Node>,
@@ -145,17 +166,82 @@ pub struct LdkInvoiceResult {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LdkChannelInfo {
-    pub channel_id: String,
-    pub counterparty_pubkey: String,
-    pub is_channel_ready: bool,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_channel_id: Option<String>,
+    pub peer_pubkey: String,
+    pub state: String,
+    pub is_private: bool,
+    pub local_balance: u64,
+    pub remote_balance: u64,
+    pub capacity: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funding_txid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funding_output_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LdkPeerInfo {
-    pub node_id: String,
+    pub pubkey: String,
     pub address: String,
-    pub is_persisted: bool,
-    pub is_connected: bool,
+    pub connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    pub num_channels: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LdkChannelFees {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_channel_id: Option<String>,
+    pub peer_pubkey: String,
+    pub base_fee_msat: u32,
+    pub fee_rate: u32,
+    pub min_htlc_msat: u64,
+    pub max_htlc_msat: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkNodeInfo {
+    pub pubkey: String,
+    pub alias: String,
+    pub color: String,
+    pub num_channels: usize,
+    pub total_capacity: u64,
+    pub addresses: Vec<String>,
+    pub last_update: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkChannelPolicy {
+    pub base_fee_msat: u32,
+    pub fee_rate: u32,
+    pub min_htlc_msat: u64,
+    pub max_htlc_msat: u64,
+    pub time_lock_delta: u16,
+    pub disabled: bool,
+    pub last_update: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkChannelInfo {
+    pub short_channel_id: String,
+    pub capacity: Option<u64>,
+    pub node1_pubkey: String,
+    pub node2_pubkey: String,
+    pub node1_policy: Option<NetworkChannelPolicy>,
+    pub node2_policy: Option<NetworkChannelPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkStats {
+    pub num_nodes: usize,
+    pub num_channels: usize,
+    pub total_capacity: u64,
+    pub avg_channel_size: u64,
+    pub max_channel_size: u64,
 }
 
 impl LdkService {
@@ -196,8 +282,19 @@ impl LdkService {
         }))
     }
 
+    pub fn node(&self) -> &Arc<Node> {
+        &self.node
+    }
+
     pub fn node_id(&self) -> String {
         self.node.node_id().to_string()
+    }
+
+    pub fn status(&self) -> LdkNodeStatus {
+        let status = self.node.status();
+        LdkNodeStatus {
+            latest_best_block_height: status.current_best_block.height,
+        }
     }
 
     pub fn network(&self) -> &'static str {
@@ -216,10 +313,30 @@ impl LdkService {
             .map_err(|e| LdkServiceError::SyncFailed(e.to_string()))
     }
 
+    pub fn get_balance(&self) -> Result<LdkBalance, LdkServiceError> {
+        let balances = self.node.list_balances();
+        let onchain_msat = balances
+            .spendable_onchain_balance_sats
+            .checked_mul(1000)
+            .ok_or(LdkServiceError::BalanceOverflow {
+                sats: balances.spendable_onchain_balance_sats,
+            })?;
+        let lightning_msat = balances
+            .total_lightning_balance_sats
+            .checked_mul(1000)
+            .ok_or(LdkServiceError::BalanceOverflow {
+                sats: balances.total_lightning_balance_sats,
+            })?;
+        let total_msat = onchain_msat
+            .checked_add(lightning_msat)
+            .ok_or(LdkServiceError::BalanceOverflow {
+                sats: balances.spendable_onchain_balance_sats + balances.total_lightning_balance_sats,
+            })?;
+        Ok(LdkBalance { total_msat, lightning_msat, onchain_msat })
+    }
+
     pub fn get_balance_msat(&self) -> Result<u64, LdkServiceError> {
-        let sats = self.node.list_balances().spendable_onchain_balance_sats;
-        sats.checked_mul(1000)
-            .ok_or(LdkServiceError::BalanceOverflow { sats })
+        Ok(self.get_balance()?.total_msat)
     }
 
     pub fn new_onchain_address(&self) -> Result<String, LdkServiceError> {
@@ -393,24 +510,36 @@ impl LdkService {
         self.node
             .list_channels()
             .iter()
-            .map(|channel| LdkChannelInfo {
-                channel_id: channel.channel_id.to_string(),
-                counterparty_pubkey: channel.counterparty_node_id.to_string(),
-                is_channel_ready: channel.is_channel_ready,
+            .map(|channel| {
+                let state = if channel.is_channel_ready && channel.is_usable {
+                    "active"
+                } else if channel.is_channel_ready {
+                    "inactive"
+                } else {
+                    "pending_open"
+                };
+
+                let short_channel_id = channel.short_channel_id.map(format_scid);
+
+                let (funding_txid, funding_output_index) = channel
+                    .funding_txo
+                    .map(|txo| (Some(txo.txid.to_string()), Some(txo.vout)))
+                    .unwrap_or((None, None));
+
+                LdkChannelInfo {
+                    id: channel.channel_id.to_string(),
+                    short_channel_id,
+                    peer_pubkey: channel.counterparty_node_id.to_string(),
+                    state: state.to_string(),
+                    is_private: !channel.is_announced,
+                    local_balance: channel.outbound_capacity_msat,
+                    remote_balance: channel.inbound_capacity_msat,
+                    capacity: channel.channel_value_sats * 1000,
+                    funding_txid,
+                    funding_output_index,
+                }
             })
             .collect()
-    }
-
-    pub fn get_channel(&self, channel_id: &str) -> Option<LdkChannelInfo> {
-        self.node
-            .list_channels()
-            .iter()
-            .find(|channel| channel.channel_id.to_string() == channel_id)
-            .map(|channel| LdkChannelInfo {
-                channel_id: channel.channel_id.to_string(),
-                counterparty_pubkey: channel.counterparty_node_id.to_string(),
-                is_channel_ready: channel.is_channel_ready,
-            })
     }
 
     pub fn close_channel(&self, channel_id: &str, force: bool) -> Result<(), LdkServiceError> {
@@ -440,16 +569,305 @@ impl LdkService {
     }
 
     pub fn list_peers(&self) -> Vec<LdkPeerInfo> {
+        let channels = self.node.list_channels();
         self.node
             .list_peers()
             .iter()
-            .map(|peer| LdkPeerInfo {
-                node_id: peer.node_id.to_string(),
-                address: peer.address.to_string(),
-                is_persisted: peer.is_persisted,
-                is_connected: peer.is_connected,
+            .map(|peer| {
+                let num_channels = channels
+                    .iter()
+                    .filter(|c| c.counterparty_node_id == peer.node_id)
+                    .count();
+                LdkPeerInfo {
+                    pubkey: peer.node_id.to_string(),
+                    address: peer.address.to_string(),
+                    connected: peer.is_connected,
+                    alias: None,
+                    num_channels,
+                }
             })
             .collect()
+    }
+
+    pub fn get_channel_fees(&self, channel_id: Option<&str>) -> Vec<LdkChannelFees> {
+        self.node
+            .list_channels()
+            .iter()
+            .filter(|c| match channel_id {
+                Some(id) => c.channel_id.to_string() == id,
+                None => true,
+            })
+            .map(|channel| {
+                let short_channel_id = channel.short_channel_id.map(|scid| format_scid(scid));
+                LdkChannelFees {
+                    id: channel.channel_id.to_string(),
+                    short_channel_id,
+                    peer_pubkey: channel.counterparty_node_id.to_string(),
+                    base_fee_msat: channel.config.forwarding_fee_base_msat,
+                    fee_rate: channel.config.forwarding_fee_proportional_millionths,
+                    min_htlc_msat: channel.inbound_htlc_minimum_msat,
+                    max_htlc_msat: channel.inbound_htlc_maximum_msat,
+                }
+            })
+            .collect()
+    }
+
+    pub fn set_channel_fees(
+        &self,
+        channel_id: &str,
+        base_fee_msat: Option<u32>,
+        fee_rate: Option<u32>,
+    ) -> Result<(), LdkServiceError> {
+        let details = self
+            .node
+            .list_channels()
+            .into_iter()
+            .find(|c| c.channel_id.to_string() == channel_id)
+            .ok_or_else(|| {
+                LdkServiceError::ChannelFailed(format!("channel not found: {channel_id}"))
+            })?;
+
+        let mut config = details.config;
+        if let Some(base) = base_fee_msat {
+            config.forwarding_fee_base_msat = base;
+        }
+        if let Some(rate) = fee_rate {
+            config.forwarding_fee_proportional_millionths = rate;
+        }
+
+        self.node
+            .update_channel_config(
+                &details.user_channel_id,
+                details.counterparty_node_id,
+                config,
+            )
+            .map_err(|e| LdkServiceError::ChannelFailed(e.to_string()))
+    }
+
+    pub fn list_network_nodes(&self, limit: usize, offset: usize) -> Vec<NetworkNodeInfo> {
+        let graph = self.node.network_graph();
+        let node_ids = graph.list_nodes();
+        node_ids
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .filter_map(|node_id| {
+                let info = graph.node(node_id)?;
+                Some(map_node_info(node_id, &info, &graph))
+            })
+            .collect()
+    }
+
+    pub fn get_network_node(&self, pubkey: &str) -> Result<Option<NetworkNodeInfo>, LdkServiceError> {
+        let pk = PublicKey::from_str(pubkey)
+            .map_err(|e| LdkServiceError::InvalidPubkey(e.to_string()))?;
+        let node_id = NodeId::from_pubkey(&pk);
+        let graph = self.node.network_graph();
+        let info = graph.node(&node_id);
+        Ok(info.map(|i| map_node_info(&node_id, &i, &graph)))
+    }
+
+    pub fn get_network_stats(&self) -> NetworkStats {
+        let graph = self.node.network_graph();
+        let num_nodes = graph.list_nodes().len();
+        let channel_ids = graph.list_channels();
+        let num_channels = channel_ids.len();
+        let mut total_capacity: u64 = 0;
+        let mut max_channel_size: u64 = 0;
+        for scid in &channel_ids {
+            if let Some(ch) = graph.channel(*scid) {
+                let cap = ch.capacity_sats.unwrap_or(0);
+                total_capacity = total_capacity.saturating_add(cap);
+                if cap > max_channel_size {
+                    max_channel_size = cap;
+                }
+            }
+        }
+        let avg_channel_size = if num_channels > 0 {
+            total_capacity / num_channels as u64
+        } else {
+            0
+        };
+        NetworkStats {
+            num_nodes,
+            num_channels,
+            total_capacity,
+            avg_channel_size,
+            max_channel_size,
+        }
+    }
+
+    pub fn get_network_channel(&self, scid_str: &str) -> Result<Option<NetworkChannelInfo>, LdkServiceError> {
+        let scid = parse_scid(scid_str)
+            .ok_or_else(|| LdkServiceError::ChannelFailed(format!("invalid scid format: {scid_str}")))?;
+        let graph = self.node.network_graph();
+        Ok(graph.channel(scid).map(|ch| {
+            let node1_policy = ch.one_to_two.as_ref().map(|p| NetworkChannelPolicy {
+                base_fee_msat: p.fees.base_msat,
+                fee_rate: p.fees.proportional_millionths,
+                min_htlc_msat: p.htlc_minimum_msat,
+                max_htlc_msat: p.htlc_maximum_msat,
+                time_lock_delta: p.cltv_expiry_delta,
+                disabled: !p.enabled,
+                last_update: p.last_update,
+            });
+            let node2_policy = ch.two_to_one.as_ref().map(|p| NetworkChannelPolicy {
+                base_fee_msat: p.fees.base_msat,
+                fee_rate: p.fees.proportional_millionths,
+                min_htlc_msat: p.htlc_minimum_msat,
+                max_htlc_msat: p.htlc_maximum_msat,
+                time_lock_delta: p.cltv_expiry_delta,
+                disabled: !p.enabled,
+                last_update: p.last_update,
+            });
+            NetworkChannelInfo {
+                short_channel_id: format_scid(scid),
+                capacity: ch.capacity_sats,
+                node1_pubkey: ch.node_one.to_string(),
+                node2_pubkey: ch.node_two.to_string(),
+                node1_policy,
+                node2_policy,
+            }
+        }))
+    }
+
+    pub fn lookup_payment_by_hash(&self, payment_hash: &str) -> Result<PaymentDetails, LdkServiceError> {
+        let hash_bytes = decode_hex(payment_hash)
+            .map_err(|e| LdkServiceError::PaymentNotFound(format!("invalid payment hash hex: {e}")))?;
+        let arr: [u8; 32] = hash_bytes
+            .try_into()
+            .map_err(|_| LdkServiceError::PaymentNotFound("payment hash must be 32 bytes".to_string()))?;
+        let payment_id = PaymentId(arr);
+        self.node
+            .payment(&payment_id)
+            .ok_or_else(|| LdkServiceError::PaymentNotFound(payment_hash.to_string()))
+    }
+
+    pub fn lookup_payment_by_bolt11(&self, invoice_str: &str) -> Result<PaymentDetails, LdkServiceError> {
+        let invoice = Bolt11Invoice::from_str(invoice_str)
+            .map_err(|e| LdkServiceError::InvalidInvoice(e.to_string()))?;
+        let hash = invoice.payment_hash().to_string();
+        self.lookup_payment_by_hash(&hash)
+    }
+
+    pub fn list_payments_filtered(
+        &self,
+        from: Option<u64>,
+        until: Option<u64>,
+        limit: Option<u64>,
+        offset: Option<u64>,
+        unpaid: Option<bool>,
+        direction: Option<PaymentDirection>,
+        payment_method: Option<PaymentMethod>,
+    ) -> Vec<PaymentDetails> {
+        let mut payments: Vec<PaymentDetails> = self
+            .node
+            .list_payments()
+            .into_iter()
+            .filter(|p| {
+                if let Some(from_ts) = from {
+                    if p.latest_update_timestamp < from_ts {
+                        return false;
+                    }
+                }
+                if let Some(until_ts) = until {
+                    if p.latest_update_timestamp > until_ts {
+                        return false;
+                    }
+                }
+                if let Some(dir) = &direction {
+                    if p.direction != *dir {
+                        return false;
+                    }
+                }
+                if let Some(pm) = &payment_method {
+                    let matches = match (pm, &p.kind) {
+                        (PaymentMethod::Bolt11, PaymentKind::Bolt11 { .. })
+                        | (PaymentMethod::Bolt11, PaymentKind::Bolt11Jit { .. }) => true,
+                        (PaymentMethod::Bolt12, PaymentKind::Bolt12Offer { .. })
+                        | (PaymentMethod::Bolt12, PaymentKind::Bolt12Refund { .. }) => true,
+                        (PaymentMethod::Keysend, PaymentKind::Spontaneous { .. }) => true,
+                        _ => false,
+                    };
+                    if !matches {
+                        return false;
+                    }
+                }
+                let include_unpaid = unpaid.unwrap_or(false);
+                if !include_unpaid && p.status == PaymentStatus::Pending {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        payments.sort_by(|a, b| b.latest_update_timestamp.cmp(&a.latest_update_timestamp));
+
+        let offset_val = offset.unwrap_or(0) as usize;
+        let payments = if offset_val > 0 {
+            payments.into_iter().skip(offset_val).collect()
+        } else {
+            payments
+        };
+
+        if let Some(lim) = limit {
+            payments.into_iter().take(lim as usize).collect()
+        } else {
+            payments
+        }
+    }
+
+    pub fn pay_onchain(
+        &self,
+        address: &str,
+        amount_sats: u64,
+        _feerate: Option<u64>,
+    ) -> Result<String, LdkServiceError> {
+        let addr = Address::from_str(address)
+            .map_err(|e| LdkServiceError::InvalidAddress(e.to_string()))?
+            .require_network(self.network)
+            .map_err(|e| LdkServiceError::InvalidAddress(e.to_string()))?;
+
+        let txid = self
+            .node
+            .onchain_payment()
+            .send_to_address(&addr, amount_sats, None)
+            .map_err(|e| LdkServiceError::PaymentFailed(e.to_string()))?;
+
+        Ok(txid.to_string())
+    }
+
+    pub fn make_offer(
+        &self,
+        amount_msat: u64,
+        description: &str,
+        expiry_secs: Option<u32>,
+    ) -> Result<String, LdkServiceError> {
+        let offer = self
+            .node
+            .bolt12_payment()
+            .receive(amount_msat, description, expiry_secs, None)
+            .map_err(|e| LdkServiceError::OfferFailed(e.to_string()))?;
+
+        Ok(offer.to_string())
+    }
+
+    pub fn pay_offer(
+        &self,
+        offer_str: &str,
+        _amount: Option<u64>,
+        payer_note: Option<String>,
+    ) -> Result<LdkPaymentResult, LdkServiceError> {
+        let offer = Offer::from_str(offer_str)
+            .map_err(|e| LdkServiceError::OfferFailed(format!("invalid offer: {e:?}")))?;
+
+        let payment_id = self
+            .node
+            .bolt12_payment()
+            .send(&offer, None, payer_note, None)
+            .map_err(|e| LdkServiceError::PaymentFailed(e.to_string()))?;
+
+        self.wait_for_outbound_payment(payment_id)
     }
 
     fn wait_for_outbound_payment(
@@ -503,6 +921,59 @@ impl LdkService {
     }
 }
 
+fn format_scid(scid: u64) -> String {
+    let block = scid >> 40;
+    let tx = (scid >> 16) & 0xFFFFFF;
+    let vout = scid & 0xFFFF;
+    format!("{block}x{tx}x{vout}")
+}
+
+fn parse_scid(s: &str) -> Option<u64> {
+    let parts: Vec<&str> = s.split('x').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let block: u64 = parts[0].parse().ok()?;
+    let tx: u64 = parts[1].parse().ok()?;
+    let vout: u64 = parts[2].parse().ok()?;
+    Some((block << 40) | (tx << 16) | vout)
+}
+
+fn map_node_info(
+    node_id: &NodeId,
+    info: &ldk_node::lightning::routing::gossip::NodeInfo,
+    graph: &ldk_node::graph::NetworkGraph,
+) -> NetworkNodeInfo {
+    let (alias, color, addresses, last_update) = match &info.announcement_info {
+        Some(ann) => {
+            let alias = ann.alias().to_string();
+            let rgb = ann.rgb();
+            let color = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+            let addresses: Vec<String> = ann.addresses().iter().map(|a| a.to_string()).collect();
+            let last_update = ann.last_update();
+            (alias, color, addresses, last_update)
+        }
+        None => (String::new(), "#000000".to_string(), Vec::new(), 0),
+    };
+
+    let total_capacity: u64 = info
+        .channels
+        .iter()
+        .filter_map(|scid| graph.channel(*scid))
+        .map(|ch| ch.capacity_sats.unwrap_or(0))
+        .sum();
+
+    NetworkNodeInfo {
+        pubkey: node_id.to_string(),
+        alias,
+        color,
+        num_channels: info.channels.len(),
+        total_capacity,
+        addresses,
+        last_update,
+    }
+}
+
 fn hex_string(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -510,4 +981,14 @@ fn hex_string(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{:02x}", b);
     }
     out
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err("odd-length hex string".to_string());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
 }
