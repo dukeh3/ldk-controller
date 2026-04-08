@@ -787,6 +787,7 @@ impl LdkService {
                         (PaymentMethod::Bolt12, PaymentKind::Bolt12Offer { .. })
                         | (PaymentMethod::Bolt12, PaymentKind::Bolt12Refund { .. }) => true,
                         (PaymentMethod::Keysend, PaymentKind::Spontaneous { .. }) => true,
+                        (PaymentMethod::Onchain, PaymentKind::Onchain { .. }) => true,
                         _ => false,
                     };
                     if !matches {

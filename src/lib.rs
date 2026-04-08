@@ -826,12 +826,12 @@ fn preimage_from_kind(kind: &PaymentKind) -> Option<String> {
     }
 }
 
-fn payment_method_from_kind(kind: &PaymentKind) -> Option<PaymentMethod> {
+fn payment_method_from_kind(kind: &PaymentKind) -> PaymentMethod {
     match kind {
-        PaymentKind::Bolt11 { .. } | PaymentKind::Bolt11Jit { .. } => Some(PaymentMethod::Bolt11),
-        PaymentKind::Bolt12Offer { .. } | PaymentKind::Bolt12Refund { .. } => Some(PaymentMethod::Bolt12),
-        PaymentKind::Spontaneous { .. } => Some(PaymentMethod::Keysend),
-        _ => None,
+        PaymentKind::Bolt11 { .. } | PaymentKind::Bolt11Jit { .. } => PaymentMethod::Bolt11,
+        PaymentKind::Bolt12Offer { .. } | PaymentKind::Bolt12Refund { .. } => PaymentMethod::Bolt12,
+        PaymentKind::Spontaneous { .. } => PaymentMethod::Keysend,
+        PaymentKind::Onchain { .. } => PaymentMethod::Onchain,
     }
 }
 
@@ -844,7 +844,8 @@ fn hex_payment_hash(bytes: &[u8]) -> String {
     out
 }
 
-fn payment_details_to_lookup_invoice_response(payment: &PaymentDetails) -> LookupInvoiceResponse {
+/// Convert LDK PaymentDetails to a NIP-47 LookupInvoiceResponse.
+pub fn payment_details_to_lookup_response(payment: &PaymentDetails) -> LookupInvoiceResponse {
     let transaction_type = match payment.direction {
         PaymentDirection::Inbound => Some(TransactionType::Incoming),
         PaymentDirection::Outbound => Some(TransactionType::Outgoing),
@@ -879,7 +880,7 @@ fn payment_details_to_lookup_invoice_response(payment: &PaymentDetails) -> Looku
         expires_at: None,
         settled_at,
         metadata: None,
-        payment_method: payment_method_from_kind(&payment.kind),
+        payment_method: Some(payment_method_from_kind(&payment.kind)),
     }
 }
 
@@ -1191,7 +1192,7 @@ impl Handler for LookupInvoiceHandler {
 
                 match payment {
                     Ok(details) => {
-                        let response = payment_details_to_lookup_invoice_response(&details);
+                        let response = payment_details_to_lookup_response(&details);
                         return Ok(Response {
                             result_type: Method::LookupInvoice,
                             error: None,
@@ -1269,7 +1270,7 @@ impl Handler for ListTransactionsHandler {
 
                 let transactions: Vec<LookupInvoiceResponse> = payments
                     .iter()
-                    .map(payment_details_to_lookup_invoice_response)
+                    .map(payment_details_to_lookup_response)
                     .collect();
 
                 return Ok(Response {
