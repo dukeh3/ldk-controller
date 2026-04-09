@@ -732,7 +732,7 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
 

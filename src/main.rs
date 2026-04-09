@@ -43,6 +43,12 @@ struct BitcoindConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+        )
+        .init();
+
     let contents = fs::read_to_string("config.toml").expect("Failed to read config.toml");
     let config: Config = toml::from_str(&contents).expect("Failed to parse config.toml");
 
