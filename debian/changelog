@@ -1,4 +1,4 @@
-ldk-controller (0.5.0-2) unstable; urgency=medium
+ldk-controller (0.5.1-1) unstable; urgency=medium
 
   * Fix WebSocket PING/PONG keepalive (nostr-sdk rev 4e20d22b)
   * Relay connections no longer drop after idle periods
