@@ -685,15 +685,19 @@ pub async fn run_nwc_service(keys: Keys, relay_url: &str) -> Result<Client> {
     let our_pubkey = keys.public_key();
 
     // Subscribe to wallet requests addressed to us (p-tagged with our pubkey)
+    // Use since=now to ignore stale requests from before we started
+    let startup_time = Timestamp::now();
     let wallet_filter = Filter::new()
         .kind(Kind::WalletConnectRequest)
-        .pubkey(our_pubkey);
+        .pubkey(our_pubkey)
+        .since(startup_time);
     client.subscribe(wallet_filter).await?;
 
     // Subscribe to control requests addressed to us (p-tagged with our pubkey)
     let control_filter = Filter::new()
         .kind(Kind::Custom(CONTROL_REQUEST_KIND))
-        .pubkey(our_pubkey);
+        .pubkey(our_pubkey)
+        .since(startup_time);
     client.subscribe(control_filter).await?;
 
     // Subscribe to access grant updates (Kind 30078).
