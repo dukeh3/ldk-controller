@@ -6,7 +6,8 @@ use serde_json::{json, Value};
 use nwc::nostr::nips::nip04;
 use nwc::nostr::nips::nip44;
 use nwc::nostr::nips::nip47::{
-    CancelHoldInvoiceResponse, ErrorCode, GetBalanceResponse, GetInfoResponse,
+    CancelHoldInvoiceResponse, ErrorCode,
+    EstimateRoutingFeesResponse, GetBalanceResponse, GetInfoResponse,
     LookupInvoiceResponse, MakeHoldInvoiceResponse, MakeInvoiceResponse, MakeNewAddressResponse,
     MakeOfferResponse, Method, NIP47Error, Notification, NotificationResult, NotificationType,
     PayBip321Response, PayInvoiceResponse, PayKeysendResponse, PaymentNotification,
@@ -576,6 +577,8 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::LookupAddress,
     Method::PayBip321,
     Method::SubscribeNotifications,
+    Method::EstimateOnchainFees,
+    Method::EstimateRoutingFees,
 ];
 
 pub const CONTROL_INFO_KIND: u16 = 13198;
@@ -596,7 +599,6 @@ const SUPPORTED_CONTROL_METHODS: &[&str] = &[
     "get_network_channel",
     "get_forwarding_history",
     "get_pending_htlcs",
-    "estimate_route_fee",
     "query_routes",
 ];
 
@@ -1822,6 +1824,83 @@ impl Handler for PayBip321Handler {
     }
 }
 
+struct EstimateOnchainFeesHandler;
+
+impl Handler for EstimateOnchainFeesHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if req.params != RequestParams::EstimateOnchainFees {
+            return Err(NIP47Error {
+                code: ErrorCode::Other,
+                message: "invalid params for estimate_onchain_fees".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn execute(&self, _req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        // TODO: implement actual on-chain fee estimation via LDK/esplora
+        Err(NIP47Error {
+            code: ErrorCode::NotImplemented,
+            message: "estimate_onchain_fees not yet implemented".to_string(),
+        })
+    }
+}
+
+struct EstimateRoutingFeesHandler;
+
+impl Handler for EstimateRoutingFeesHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::EstimateRoutingFees(ref params) = req.params {
+            if params.destination.is_empty() || params.amount == 0 {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "destination and amount required".to_string(),
+                });
+            }
+            Ok(())
+        } else {
+            Err(NIP47Error {
+                code: ErrorCode::Other,
+                message: "invalid params for estimate_routing_fees".to_string(),
+            })
+        }
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let RequestParams::EstimateRoutingFees(ref params) = req.params {
+            let routes = if let Some(ldk_service) = get_ldk_service() {
+                ldk_service.find_routes(&params.destination, params.amount, 1)
+            } else {
+                Vec::new()
+            };
+
+            if routes.is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "no route found to destination".to_string(),
+                });
+            }
+
+            let route = &routes[0];
+            Ok(Response {
+                result_type: Method::EstimateRoutingFees,
+                error: None,
+                result: Some(ResponseResult::EstimateRoutingFees(
+                    EstimateRoutingFeesResponse {
+                        fee: route.total_fee,
+                        time_lock_delay: route.total_time_lock,
+                    },
+                )),
+            })
+        } else {
+            Err(NIP47Error {
+                code: ErrorCode::Other,
+                message: "invalid params for estimate_routing_fees".to_string(),
+            })
+        }
+    }
+}
+
 // Lazily initialize a static handler map to avoid rebuilding it per request.
 fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
     static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
@@ -1851,6 +1930,14 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
         handlers.insert(Method::LookupOffer, Box::new(LookupOfferHandler));
         handlers.insert(Method::LookupAddress, Box::new(LookupAddressHandler));
         handlers.insert(Method::PayBip321, Box::new(PayBip321Handler));
+        handlers.insert(
+            Method::EstimateOnchainFees,
+            Box::new(EstimateOnchainFeesHandler),
+        );
+        handlers.insert(
+            Method::EstimateRoutingFees,
+            Box::new(EstimateRoutingFeesHandler),
+        );
         handlers
     })
 }
@@ -2734,59 +2821,6 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         return ControlResponse {
             result_type: request.method,
             result: Some(json!({ "routes": routes })),
-            error: None,
-        };
-    }
-
-    // estimate_route_fee: find cheapest route and return fee + time_lock_delay.
-    // NOTE: planned to move to NWC once Method enum supports it (see #102).
-    if request.method == "estimate_route_fee" {
-        let destination = request
-            .params
-            .get("destination")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let amount_msat = request
-            .params
-            .get("amount")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-
-        if destination.is_empty() || amount_msat == 0 {
-            return ControlResponse {
-                result_type: request.method,
-                result: None,
-                error: Some(control_error(
-                    "OTHER",
-                    "destination and amount required".to_string(),
-                )),
-            };
-        }
-
-        let routes = if let Some(ldk_service) = get_ldk_service() {
-            ldk_service.find_routes(destination, amount_msat, 1)
-        } else {
-            Vec::new()
-        };
-
-        if routes.is_empty() {
-            return ControlResponse {
-                result_type: request.method,
-                result: None,
-                error: Some(control_error(
-                    "NOT_FOUND",
-                    "no route found to destination".to_string(),
-                )),
-            };
-        }
-
-        let route = &routes[0];
-        return ControlResponse {
-            result_type: request.method,
-            result: Some(json!({
-                "fee": route.total_fee,
-                "time_lock_delay": route.total_time_lock
-            })),
             error: None,
         };
     }
