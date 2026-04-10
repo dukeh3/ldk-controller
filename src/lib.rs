@@ -9,7 +9,7 @@ use nwc::nostr::nips::nip47::{
     CancelHoldInvoiceResponse, ErrorCode, GetBalanceResponse, GetInfoResponse,
     LookupInvoiceResponse, MakeHoldInvoiceResponse, MakeInvoiceResponse, MakeNewAddressResponse,
     MakeOfferResponse, Method, NIP47Error, Notification, NotificationResult, NotificationType,
-    PayInvoiceResponse, PayKeysendResponse, PaymentNotification,
+    PayBip321Response, PayInvoiceResponse, PayKeysendResponse, PaymentNotification,
     PayOfferResponse, PayOnchainResponse, Request, RequestParams, Response, ResponseResult,
     SettleHoldInvoiceResponse, SubscribeNotificationsResponse, TransactionState, TransactionType,
     LookupOfferResponse, LookupAddressResponse, AddressTransaction,
@@ -45,6 +45,7 @@ static OWNERS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 static APPLIED_GRANT_EVENTS: OnceLock<RwLock<HashMap<String, AppliedGrantEvent>>> = OnceLock::new();
 static FORCED_EXECUTE_FAILURES: OnceLock<RwLock<HashSet<Method>>> = OnceLock::new();
 static LDK_SERVICE: OnceLock<RwLock<Option<Arc<LdkService>>>> = OnceLock::new();
+static NODE_ALIAS: OnceLock<Option<String>> = OnceLock::new();
 
 pub const CONTROL_REQUEST_KIND: u16 = 23198;
 pub const CONTROL_RESPONSE_KIND: u16 = 23199;
@@ -485,6 +486,12 @@ fn request_spend_msat(request: &Request) -> Option<u64> {
         RequestParams::PayKeysend(params) => Some(params.amount),
         RequestParams::PayOnchain(params) => Some(params.amount.saturating_mul(1000)),
         RequestParams::PayOffer(params) => params.amount,
+        RequestParams::PayBip321(params) => {
+            bip321::Uri::parse(&params.uri)
+                .ok()
+                .and_then(|uri| uri.amount)
+                .map(|a| a.to_sat() * 1000)
+        }
         _ => None,
     }
 }
@@ -567,6 +574,7 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::MakeOffer,
     Method::LookupOffer,
     Method::LookupAddress,
+    Method::PayBip321,
     Method::SubscribeNotifications,
 ];
 
@@ -784,7 +792,9 @@ pub async fn run_nwc_service_with_ldk(
     keys: Keys,
     relay_url: &str,
     ldk_service: Arc<LdkService>,
+    node_alias: Option<String>,
 ) -> Result<Client> {
+    let _ = NODE_ALIAS.set(node_alias);
     set_ldk_service(ldk_service.clone());
     let client = run_nwc_service(keys.clone(), relay_url).await?;
 
@@ -879,7 +889,11 @@ fn payment_details_to_lookup_invoice_response(payment: &PaymentDetails) -> Looku
         payment_hash,
         amount: payment.amount_msat.unwrap_or(0),
         fees_paid: payment.fee_paid_msat.unwrap_or(0),
-        created_at: Timestamp::from(payment.latest_update_timestamp),
+        created_at: if payment.latest_update_timestamp > 0 {
+            Some(Timestamp::from(payment.latest_update_timestamp))
+        } else {
+            None
+        },
         expires_at: None,
         settled_at,
         metadata: None,
@@ -924,7 +938,7 @@ impl Handler for GetInfoHandler {
             result_type: Method::GetInfo,
             error: None,
             result: Some(ResponseResult::GetInfo(GetInfoResponse {
-                alias: Some("ldk-controller".to_string()),
+                alias: Some(NODE_ALIAS.get().and_then(|a| a.clone()).unwrap_or_else(|| "ldk-controller".to_string())),
                 color: None,
                 pubkey: Some(pubkey),
                 network: Some(network),
@@ -1134,7 +1148,7 @@ impl Handler for MakeInvoiceHandler {
                     description_hash: params.description_hash.clone(),
                     preimage: None,
                     amount: invoice.amount_msat,
-                    created_at: None,
+                    created_at: Some(Timestamp::now()),
                     expires_at: invoice.expires_at.map(Into::into),
                 })),
             });
@@ -1229,7 +1243,7 @@ impl Handler for LookupInvoiceHandler {
                 payment_hash: "00".to_string(),
                 amount: 0,
                 fees_paid: 0,
-                created_at: Timestamp::now(),
+                created_at: Some(Timestamp::now()),
                 expires_at: None,
                 settled_at: None,
                 metadata: None,
@@ -1698,6 +1712,116 @@ impl Handler for LookupAddressHandler {
     }
 }
 
+struct PayBip321Handler;
+
+impl Handler for PayBip321Handler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::PayBip321(params) = &req.params {
+            if params.uri.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "uri is required".to_string(),
+                });
+            }
+            bip321::Uri::parse(&params.uri).map_err(|e| NIP47Error {
+                code: ErrorCode::Other,
+                message: format!("invalid BIP-321 URI: {e}"),
+            })?;
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for pay_bip321".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let ldk_service = get_ldk_service().ok_or_else(|| NIP47Error {
+            code: ErrorCode::Other,
+            message: "ldk service unavailable".to_string(),
+        })?;
+
+        if let RequestParams::PayBip321(params) = &req.params {
+            let uri = bip321::Uri::parse(&params.uri).map_err(|e| NIP47Error {
+                code: ErrorCode::Other,
+                message: format!("invalid BIP-321 URI: {e}"),
+            })?;
+
+            let amount_msat = uri.amount.map(|a| a.to_sat() * 1000);
+
+            // Priority: lightning (BOLT11) > lno (BOLT12) > on-chain address
+            if let Some(invoice) = uri.lightning.first() {
+                let payment = ldk_service
+                    .pay_invoice(invoice.as_str(), amount_msat)
+                    .map_err(|e| map_ldk_service_error("pay_bip321/bolt11", ErrorCode::PaymentFailed, e))?;
+                return Ok(Response {
+                    result_type: Method::PayBip321,
+                    error: None,
+                    result: Some(ResponseResult::PayBip321(PayBip321Response {
+                        preimage: Some(payment.preimage),
+                        txid: None,
+                        fees_paid: payment.fees_paid_msat,
+                        payment_method: "bolt11".to_string(),
+                    })),
+                });
+            }
+
+            if let Some(offer) = uri.lno.first() {
+                let payment = ldk_service
+                    .pay_offer(offer.as_str(), amount_msat, None)
+                    .map_err(|e| map_ldk_service_error("pay_bip321/bolt12", ErrorCode::PaymentFailed, e))?;
+                return Ok(Response {
+                    result_type: Method::PayBip321,
+                    error: None,
+                    result: Some(ResponseResult::PayBip321(PayBip321Response {
+                        preimage: Some(payment.preimage),
+                        txid: None,
+                        fees_paid: payment.fees_paid_msat,
+                        payment_method: "bolt12".to_string(),
+                    })),
+                });
+            }
+
+            if uri.address.is_some() {
+                let amount_sat = uri.amount
+                    .map(|a| a.to_sat())
+                    .ok_or_else(|| NIP47Error {
+                        code: ErrorCode::Other,
+                        message: "on-chain payment requires amount".to_string(),
+                    })?;
+                let addr_str = uri.address_str().ok_or_else(|| NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "missing address string".to_string(),
+                })?;
+                let txid = ldk_service
+                    .pay_onchain(addr_str, amount_sat, None)
+                    .map_err(|e| map_ldk_service_error("pay_bip321/onchain", ErrorCode::PaymentFailed, e))?;
+                return Ok(Response {
+                    result_type: Method::PayBip321,
+                    error: None,
+                    result: Some(ResponseResult::PayBip321(PayBip321Response {
+                        preimage: None,
+                        txid: Some(txid),
+                        fees_paid: None,
+                        payment_method: "onchain".to_string(),
+                    })),
+                });
+            }
+
+            return Err(NIP47Error {
+                code: ErrorCode::Other,
+                message: "no supported payment method in URI".to_string(),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for pay_bip321".to_string(),
+        })
+    }
+}
+
 // Lazily initialize a static handler map to avoid rebuilding it per request.
 fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>> {
     static HANDLERS: OnceLock<HashMap<Method, Box<dyn Handler + Send + Sync>>> = OnceLock::new();
@@ -1726,6 +1850,7 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
         handlers.insert(Method::PayOffer, Box::new(PayOfferHandler));
         handlers.insert(Method::LookupOffer, Box::new(LookupOfferHandler));
         handlers.insert(Method::LookupAddress, Box::new(LookupAddressHandler));
+        handlers.insert(Method::PayBip321, Box::new(PayBip321Handler));
         handlers
     })
 }
@@ -2027,10 +2152,31 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
 
         let push_msat = params.push_amount.map(|sats| sats * 1000);
-        let address = params.host.as_deref().unwrap_or("");
+        let address = if let Some(ref host) = params.host {
+            host.clone()
+        } else {
+            // Look up address from connected peers
+            match ldk_service
+                .list_peers()
+                .into_iter()
+                .find(|p| p.pubkey == params.pubkey && p.connected)
+            {
+                Some(peer) => peer.address,
+                None => {
+                    return ControlResponse {
+                        result_type: "open_channel".to_string(),
+                        result: None,
+                        error: Some(control_error(
+                            "OTHER",
+                            "peer not connected and no host provided".to_string(),
+                        )),
+                    };
+                }
+            }
+        };
         if let Err(e) = ldk_service.open_channel(
             &params.pubkey,
-            address,
+            &address,
             params.amount,
             push_msat,
         ) {
@@ -2540,6 +2686,111 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
     }
 
+    if request.method == "query_routes" {
+        let destination = request
+            .params
+            .get("destination")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let amount_msat = request
+            .params
+            .get("amount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let max_routes = request
+            .params
+            .get("max_routes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as usize;
+
+        if destination.is_empty() || amount_msat == 0 {
+            return ControlResponse {
+                result_type: request.method,
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "destination and amount required".to_string(),
+                )),
+            };
+        }
+
+        let routes = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.find_routes(destination, amount_msat, max_routes)
+        } else {
+            Vec::new()
+        };
+
+        if routes.is_empty() {
+            return ControlResponse {
+                result_type: request.method,
+                result: None,
+                error: Some(control_error(
+                    "NOT_FOUND",
+                    "no route found to destination".to_string(),
+                )),
+            };
+        }
+
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(json!({ "routes": routes })),
+            error: None,
+        };
+    }
+
+    // estimate_route_fee: find cheapest route and return fee + time_lock_delay.
+    // NOTE: planned to move to NWC once Method enum supports it (see #102).
+    if request.method == "estimate_route_fee" {
+        let destination = request
+            .params
+            .get("destination")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let amount_msat = request
+            .params
+            .get("amount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        if destination.is_empty() || amount_msat == 0 {
+            return ControlResponse {
+                result_type: request.method,
+                result: None,
+                error: Some(control_error(
+                    "OTHER",
+                    "destination and amount required".to_string(),
+                )),
+            };
+        }
+
+        let routes = if let Some(ldk_service) = get_ldk_service() {
+            ldk_service.find_routes(destination, amount_msat, 1)
+        } else {
+            Vec::new()
+        };
+
+        if routes.is_empty() {
+            return ControlResponse {
+                result_type: request.method,
+                result: None,
+                error: Some(control_error(
+                    "NOT_FOUND",
+                    "no route found to destination".to_string(),
+                )),
+            };
+        }
+
+        let route = &routes[0];
+        return ControlResponse {
+            result_type: request.method,
+            result: Some(json!({
+                "fee": route.total_fee,
+                "time_lock_delay": route.total_time_lock
+            })),
+            error: None,
+        };
+    }
+
     ControlResponse {
         result_type: request.method,
         result: None,
@@ -2778,7 +3029,7 @@ fn build_payment_received_notification(payment_hash: &str, amount_msat: u64) -> 
             payment_hash: payment_hash.to_string(),
             amount: amount_msat,
             fees_paid: 0,
-            created_at: Timestamp::now(),
+            created_at: Some(Timestamp::now()),
             expires_at: None,
             settled_at: Timestamp::now(),
             metadata: None,
@@ -2802,7 +3053,7 @@ fn build_payment_sent_notification(
             payment_hash: payment_hash.to_string(),
             amount: 0,
             fees_paid: fee_paid_msat.unwrap_or(0),
-            created_at: Timestamp::now(),
+            created_at: Some(Timestamp::now()),
             expires_at: None,
             settled_at: Timestamp::now(),
             metadata: None,

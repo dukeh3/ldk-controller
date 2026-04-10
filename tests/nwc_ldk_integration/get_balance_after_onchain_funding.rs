@@ -73,6 +73,7 @@ async fn get_balance_after_onchain_funding() -> Result<()> {
         bitcoind_rpc_password: bitcoind.rpc_password().to_string(),
         ldk_storage_dir: unique_storage_dir("nwc-ldk-e2e"),
         ldk_listen_addr: None,
+        node_alias: None,
     };
     let ldk_service = LdkService::start_from_config(&ldk_cfg).expect("ldk service should start");
 
@@ -85,7 +86,7 @@ async fn get_balance_after_onchain_funding() -> Result<()> {
     let service_keys = Keys::generate();
     let service_pubkey = service_keys.public_key();
     let _service_client =
-        run_nwc_service_with_ldk(service_keys, &relay_url, ldk_service.clone()).await?;
+        run_nwc_service_with_ldk(service_keys, &relay_url, ldk_service.clone(), None).await?;
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 

@@ -31,6 +31,7 @@ async fn start_sync_balance() {
         bitcoind_rpc_password: bitcoind.rpc_password().to_string(),
         ldk_storage_dir: unique_storage_dir("ldk-service-sync-balance"),
         ldk_listen_addr: None,
+        node_alias: None,
     };
 
     let service = LdkService::start_from_config(&cfg).expect("LdkService should start");

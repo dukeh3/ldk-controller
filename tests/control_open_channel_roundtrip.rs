@@ -101,6 +101,7 @@ async fn control_open_channel_then_list_channels() -> Result<()> {
         bitcoind_rpc_password: bitcoind.rpc_password().to_string(),
         ldk_storage_dir: unique_storage_dir("control-open-channel-node-a"),
         ldk_listen_addr: Some(format!("127.0.0.1:{port_a}")),
+        node_alias: None,
     };
     let ldk_service = LdkService::start_from_config(&ldk_cfg).expect("ldk service should start");
 
@@ -143,7 +144,7 @@ async fn control_open_channel_then_list_channels() -> Result<()> {
     let service_keys = Keys::generate();
     let service_pubkey = service_keys.public_key();
     let _service_client =
-        run_nwc_service_with_ldk(service_keys, &relay_url, ldk_service.clone()).await?;
+        run_nwc_service_with_ldk(service_keys, &relay_url, ldk_service.clone(), None).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     let controller_keys = Keys::generate();

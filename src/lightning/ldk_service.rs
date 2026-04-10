@@ -24,6 +24,7 @@ pub struct LdkServiceConfig {
     pub bitcoind_rpc_password: String,
     pub ldk_storage_dir: String,
     pub ldk_listen_addr: Option<String>,
+    pub node_alias: Option<String>,
 }
 
 impl LdkServiceConfig {
@@ -244,6 +245,21 @@ pub struct NetworkStats {
     pub max_channel_size: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteHop {
+    pub pubkey: String,
+    pub short_channel_id: String,
+    pub fee: u64,
+    pub expiry: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FoundRoute {
+    pub total_fee: u64,
+    pub total_time_lock: u32,
+    pub hops: Vec<RouteHop>,
+}
+
 impl LdkService {
     pub fn start_from_config(cfg: &LdkServiceConfig) -> Result<Arc<Self>, LdkServiceInitError> {
         cfg.validate()?;
@@ -268,6 +284,12 @@ impl LdkService {
             builder
                 .set_listening_addresses(vec![socket])
                 .map_err(|e| LdkServiceInitError::BuildFailed(e.to_string()))?;
+        }
+
+        if let Some(alias) = &cfg.node_alias {
+            builder
+                .set_node_alias(alias.clone())
+                .map_err(|e| LdkServiceInitError::BuildFailed(format!("invalid node alias: {e}")))?;
         }
 
         let node = builder
@@ -918,6 +940,117 @@ impl LdkService {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    pub fn find_routes(
+        &self,
+        dest_pubkey: &str,
+        amount_msat: u64,
+        max_routes: usize,
+    ) -> Vec<FoundRoute> {
+        use std::cmp::Reverse;
+        use std::collections::{BinaryHeap, HashMap, HashSet};
+
+        let Ok(dest_pk) = PublicKey::from_str(dest_pubkey) else {
+            return Vec::new();
+        };
+        let dest_node = NodeId::from_pubkey(&dest_pk);
+        let our_pk = self.node.node_id();
+        let our_node = NodeId::from_pubkey(&our_pk);
+
+        if our_node == dest_node {
+            return Vec::new();
+        }
+
+        let graph = self.node.network_graph();
+        let all_channels = graph.list_channels();
+
+        // Build adjacency: node_id → [(neighbor, scid, base_fee, fee_rate_ppm, cltv)]
+        type Edge = (NodeId, u64, u32, u32, u16);
+        let mut adj: HashMap<NodeId, Vec<Edge>> = HashMap::new();
+
+        for scid in &all_channels {
+            let Some(ch) = graph.channel(*scid) else { continue };
+            if let Some(upd) = &ch.one_to_two {
+                if amount_msat >= upd.htlc_minimum_msat
+                    && amount_msat <= upd.htlc_maximum_msat
+                {
+                    adj.entry(ch.node_one).or_default().push((
+                        ch.node_two,
+                        *scid,
+                        upd.fees.base_msat,
+                        upd.fees.proportional_millionths,
+                        upd.cltv_expiry_delta,
+                    ));
+                }
+            }
+            if let Some(upd) = &ch.two_to_one {
+                if amount_msat >= upd.htlc_minimum_msat
+                    && amount_msat <= upd.htlc_maximum_msat
+                {
+                    adj.entry(ch.node_two).or_default().push((
+                        ch.node_one,
+                        *scid,
+                        upd.fees.base_msat,
+                        upd.fees.proportional_millionths,
+                        upd.cltv_expiry_delta,
+                    ));
+                }
+            }
+        }
+
+        // Dijkstra: find lowest-fee paths
+        // State: (cost_msat, node, path as [(node, scid, hop_fee, cltv)])
+        let mut heap: BinaryHeap<Reverse<(u64, NodeId, Vec<(NodeId, u64, u64, u16)>)>> =
+            BinaryHeap::new();
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut found: Vec<FoundRoute> = Vec::new();
+
+        heap.push(Reverse((0, our_node, Vec::new())));
+
+        while let Some(Reverse((cost, node, path))) = heap.pop() {
+            if found.len() >= max_routes {
+                break;
+            }
+            if path.len() > 6 {
+                continue;
+            }
+            if node == dest_node {
+                let hops: Vec<RouteHop> = path
+                    .iter()
+                    .map(|(n, scid, fee, cltv)| RouteHop {
+                        pubkey: hex_string(n.as_slice()),
+                        short_channel_id: format_scid(*scid),
+                        fee: *fee,
+                        expiry: *cltv,
+                    })
+                    .collect();
+                let total_time_lock: u32 = hops.iter().map(|h| h.expiry as u32).sum();
+                found.push(FoundRoute {
+                    total_fee: cost,
+                    total_time_lock,
+                    hops,
+                });
+                continue;
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            if let Some(edges) = adj.get(&node) {
+                for (next, scid, base, prop, cltv) in edges {
+                    if visited.contains(next) {
+                        continue;
+                    }
+                    let hop_fee =
+                        *base as u64 + (amount_msat * *prop as u64) / 1_000_000;
+                    let mut new_path = path.clone();
+                    new_path.push((*next, *scid, hop_fee, *cltv));
+                    heap.push(Reverse((cost + hop_fee, *next, new_path)));
+                }
+            }
+        }
+
+        found
     }
 }
 

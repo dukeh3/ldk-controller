@@ -18,6 +18,8 @@ struct NodeConfig {
     network: String,
     listening_port: u16,
     data_dir: String,
+    #[serde(default)]
+    alias: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,11 +93,12 @@ async fn main() -> Result<()> {
             bitcoind_rpc_password: bitcoind.rpc_password.clone(),
             ldk_storage_dir: config.node.data_dir.clone(),
             ldk_listen_addr: Some(format!("0.0.0.0:{}", config.node.listening_port)),
+            node_alias: config.node.alias.clone(),
         };
         let ldk_service =
             LdkService::start_from_config(&ldk_cfg).expect("Failed to start LDK service");
         _ldk_service = Some(ldk_service.clone());
-        ldk_controller::run_nwc_service_with_ldk(keys, &config.nostr.relay, ldk_service).await?
+        ldk_controller::run_nwc_service_with_ldk(keys, &config.nostr.relay, ldk_service, config.node.alias).await?
     } else {
         _ldk_service = None;
         ldk_controller::run_nwc_service(keys, &config.nostr.relay).await?

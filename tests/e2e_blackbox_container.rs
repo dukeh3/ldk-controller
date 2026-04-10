@@ -745,6 +745,7 @@ async fn e2e_control_open_channel_and_bidirectional_payment() -> Result<()> {
         bitcoind_rpc_password: bitcoind.rpc_password().to_string(),
         ldk_storage_dir: format!("/tmp/{}", unique_id("e2e-bob-ldk")),
         ldk_listen_addr: Some(format!("127.0.0.1:{bob_listen_port}")),
+        node_alias: None,
     };
     let bob = LdkService::start_from_config(&bob_cfg).expect("start bob ldk");
 
@@ -940,6 +941,7 @@ async fn e2e_control_alice_opens_channel_and_bidirectional_payment() -> Result<(
         bitcoind_rpc_password: bitcoind.rpc_password().to_string(),
         ldk_storage_dir: format!("/tmp/{}", unique_id("e2e-bob-ldk-alice-opens")),
         ldk_listen_addr: Some(format!("0.0.0.0:{bob_listen_port}")),
+        node_alias: None,
     };
     let bob = LdkService::start_from_config(&bob_cfg).expect("start bob ldk");
 
