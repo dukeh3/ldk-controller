@@ -7,7 +7,7 @@ This folder contains the E2E-focused container build for `ldk-controller`.
 From repository root:
 
 ```bash
-docker build -f tests/e2e/docker/ldk-controller/Dockerfile -t ldk-controller:e2e .
+docker build --build-context bip321=../bip321 -f tests/e2e/docker/ldk-controller/Dockerfile -t ldk-controller:e2e .
 ```
 
 ## Runtime Contract

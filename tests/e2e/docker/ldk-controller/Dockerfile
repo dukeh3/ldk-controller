@@ -3,7 +3,12 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /app
 
-# Cache dependency compilation first
+# HACK: copy bip321 path dependency into /bip321 so that
+# Cargo.toml's `path = "../bip321"` resolves from /app.
+# Requires: --build-context bip321=../bip321
+# TODO: replace with git/registry dep (see GitHub issue)
+COPY --from=bip321 . /bip321/
+
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --bin ldk-controller

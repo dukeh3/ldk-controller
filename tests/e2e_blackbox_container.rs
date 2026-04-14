@@ -49,6 +49,8 @@ fn ensure_image_built() {
         let build = Command::new("docker")
             .args([
                 "build",
+                "--build-context",
+                "bip321=../bip321",
                 "-f",
                 "tests/e2e/docker/ldk-controller/Dockerfile",
                 "-t",

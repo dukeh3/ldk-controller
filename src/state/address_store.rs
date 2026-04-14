@@ -33,6 +33,11 @@ pub fn get_address(address: &str) -> Option<AddressRecord> {
     map.get(address).cloned()
 }
 
+pub fn list_addresses() -> Vec<AddressRecord> {
+    let map = store().read().expect("address store lock poisoned");
+    map.values().cloned().collect()
+}
+
 #[allow(dead_code)]
 pub fn record_transaction(address: &str, txid: String, amount_sats: u64, timestamp: u64) {
     let mut map = store().write().expect("address store lock poisoned");

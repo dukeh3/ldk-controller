@@ -911,6 +911,8 @@ impl LdkService {
                             PaymentKind::Bolt11 { preimage, .. } => preimage,
                             PaymentKind::Bolt11Jit { preimage, .. } => preimage,
                             PaymentKind::Spontaneous { preimage, .. } => preimage,
+                            PaymentKind::Bolt12Offer { preimage, .. } => preimage,
+                            PaymentKind::Bolt12Refund { preimage, .. } => preimage,
                             _ => None,
                         }
                         .ok_or_else(|| {

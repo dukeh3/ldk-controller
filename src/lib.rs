@@ -10,10 +10,15 @@ use nwc::nostr::nips::nip47::{
     EstimateRoutingFeesResponse, GetBalanceResponse, GetInfoResponse,
     LookupInvoiceResponse, MakeHoldInvoiceResponse, MakeInvoiceResponse, MakeNewAddressResponse,
     MakeOfferResponse, Method, NIP47Error, Notification, NotificationResult, NotificationType,
+    MakeBip321Response, Bip321MethodInfo, Bip321MethodEntry,
     PayBip321Response, PayInvoiceResponse, PayKeysendResponse, PaymentNotification,
     PayOfferResponse, PayOnchainResponse, Request, RequestParams, Response, ResponseResult,
     SettleHoldInvoiceResponse, SubscribeNotificationsResponse, TransactionState, TransactionType,
     LookupOfferResponse, LookupAddressResponse, AddressTransaction,
+    ListInvoicesResponse, InvoiceEntry,
+    ListOffersResponse, OfferEntry,
+    DisableOfferResponse,
+    ListAddressesResponse, AddressEntry,
     NncNotification, NncNotificationType, NncNotificationResult,
     ChannelOpenedNotification, ChannelClosedNotification, PaymentMethod,
 };
@@ -22,6 +27,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::lightning::{LdkBalance, LdkService, LdkServiceError, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
+use ldk_node::lightning::offers::offer::Offer;
+use std::str::FromStr;
 pub mod rate_limit_rule;
 pub mod lightning;
 mod state;
@@ -150,6 +157,34 @@ pub fn clear_usage_profiles() {
 
 pub fn clear_subscriptions() {
     subscription_store::clear();
+}
+
+#[doc(hidden)]
+pub fn seed_offer_for_testing(offer: String, description: String, amount_msat: u64) {
+    let offer_id = Offer::from_str(&offer)
+        .map(|o| o.id().0)
+        .unwrap_or([0u8; 32]);
+    offer_store::insert_offer(offer, description, amount_msat, offer_id);
+}
+
+#[doc(hidden)]
+pub fn seed_address_for_testing(address: String) {
+    address_store::register_address(address);
+}
+
+#[doc(hidden)]
+pub fn seed_address_transaction_for_testing(address: &str, txid: String, amount_sats: u64, timestamp: u64) {
+    address_store::record_transaction(address, txid, amount_sats, timestamp);
+}
+
+#[doc(hidden)]
+pub fn clear_offers_for_testing() {
+    offer_store::clear();
+}
+
+#[doc(hidden)]
+pub fn clear_addresses_for_testing() {
+    address_store::clear();
 }
 
 #[doc(hidden)]
@@ -575,7 +610,12 @@ const SUPPORTED_METHODS: &[Method] = &[
     Method::MakeOffer,
     Method::LookupOffer,
     Method::LookupAddress,
+    Method::ListInvoices,
+    Method::ListOffers,
+    Method::DisableOffer,
+    Method::ListAddresses,
     Method::PayBip321,
+    Method::MakeBip321,
     Method::SubscribeNotifications,
     Method::EstimateOnchainFees,
     Method::EstimateRoutingFees,
@@ -955,6 +995,15 @@ impl Handler for GetInfoHandler {
                     ]
                 } else {
                     vec![]
+                },
+                bip321_methods: if get_ldk_service().is_some() {
+                    Some(vec![
+                        Bip321MethodInfo { method: "bolt11".into(), address_types: None },
+                        Bip321MethodInfo { method: "bolt12".into(), address_types: None },
+                        Bip321MethodInfo { method: "onchain".into(), address_types: Some(vec!["p2tr".into()]) },
+                    ])
+                } else {
+                    None
                 },
             })),
         })
@@ -1541,7 +1590,10 @@ impl Handler for MakeOfferHandler {
                 .map_err(|e| map_ldk_service_error("make_offer", ErrorCode::Other, e))?;
 
             // Track the offer in the offer store
-            offer_store::insert_offer(offer_str.clone(), params.description.clone(), params.amount);
+            let offer_id = Offer::from_str(&offer_str)
+                .map(|o| o.id().0)
+                .unwrap_or([0u8; 32]);
+            offer_store::insert_offer(offer_str.clone(), params.description.clone(), params.amount, offer_id);
 
             return Ok(Response {
                 result_type: Method::MakeOffer,
@@ -1714,6 +1766,268 @@ impl Handler for LookupAddressHandler {
     }
 }
 
+struct ListInvoicesHandler;
+
+impl Handler for ListInvoicesHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::ListInvoices(_) = &req.params {
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for list_invoices".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let Some(ldk_service) = get_ldk_service() {
+            if let RequestParams::ListInvoices(params) = &req.params {
+                let direction = Some(PaymentDirection::Inbound);
+
+                // Map state filter to PaymentStatus-based filtering
+                let payments = ldk_service.list_payments_filtered(
+                    params.from.map(|t| t.as_secs()),
+                    params.until.map(|t| t.as_secs()),
+                    None, // we'll apply limit/offset after state filtering
+                    None,
+                    Some(true), // include unpaid/pending
+                    direction,
+                    Some(PaymentMethod::Bolt11), // invoices are bolt11
+                );
+
+                let mut invoices: Vec<InvoiceEntry> = payments
+                    .iter()
+                    .filter_map(|payment| {
+                        let state_str = match payment.status {
+                            PaymentStatus::Pending => "pending",
+                            PaymentStatus::Succeeded => "settled",
+                            PaymentStatus::Failed => "expired",
+                        };
+
+                        // Filter by state if requested
+                        if let Some(ref state_filter) = params.state {
+                            if state_filter != state_str {
+                                return None;
+                            }
+                        }
+
+                        let payment_hash = payment_hash_from_kind(&payment.kind).unwrap_or_default();
+                        let preimage = preimage_from_kind(&payment.kind);
+                        let settled_at = if payment.status == PaymentStatus::Succeeded {
+                            Some(Timestamp::from(payment.latest_update_timestamp))
+                        } else {
+                            None
+                        };
+                        let created_at = if payment.latest_update_timestamp > 0 {
+                            Some(Timestamp::from(payment.latest_update_timestamp))
+                        } else {
+                            None
+                        };
+
+                        Some(InvoiceEntry {
+                            invoice: None,
+                            description: None,
+                            payment_hash,
+                            amount: payment.amount_msat.unwrap_or(0),
+                            state: state_str.to_string(),
+                            preimage,
+                            created_at,
+                            expires_at: None,
+                            settled_at,
+                        })
+                    })
+                    .collect();
+
+                // Apply offset/limit
+                let offset = params.offset.unwrap_or(0) as usize;
+                if offset > 0 && offset < invoices.len() {
+                    invoices = invoices.split_off(offset);
+                } else if offset >= invoices.len() {
+                    invoices.clear();
+                }
+                if let Some(limit) = params.limit {
+                    invoices.truncate(limit as usize);
+                }
+
+                return Ok(Response {
+                    result_type: Method::ListInvoices,
+                    error: None,
+                    result: Some(ResponseResult::ListInvoices(ListInvoicesResponse {
+                        invoices,
+                    })),
+                });
+            }
+        }
+
+        Ok(Response {
+            result_type: Method::ListInvoices,
+            error: None,
+            result: Some(ResponseResult::ListInvoices(ListInvoicesResponse {
+                invoices: Vec::new(),
+            })),
+        })
+    }
+}
+
+struct ListOffersHandler;
+
+impl Handler for ListOffersHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::ListOffers(_) = &req.params {
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for list_offers".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let RequestParams::ListOffers(params) = &req.params {
+            let mut offers: Vec<OfferEntry> = offer_store::list_offers()
+                .iter()
+                .filter(|record| {
+                    if params.active_only.unwrap_or(false) {
+                        record.active
+                    } else {
+                        true
+                    }
+                })
+                .map(|record| OfferEntry {
+                    offer: record.offer.clone(),
+                    description: Some(record.description.clone()),
+                    amount: Some(record.amount_msat),
+                    active: record.active,
+                    num_payments_received: record.num_payments_received,
+                    total_received: record.total_received_msat,
+                })
+                .collect();
+
+            // Apply offset/limit
+            let offset = params.offset.unwrap_or(0) as usize;
+            if offset > 0 && offset < offers.len() {
+                offers = offers.split_off(offset);
+            } else if offset >= offers.len() && offset > 0 {
+                offers.clear();
+            }
+            if let Some(limit) = params.limit {
+                offers.truncate(limit as usize);
+            }
+
+            return Ok(Response {
+                result_type: Method::ListOffers,
+                error: None,
+                result: Some(ResponseResult::ListOffers(ListOffersResponse { offers })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for list_offers".to_string(),
+        })
+    }
+}
+
+struct DisableOfferHandler;
+
+impl Handler for DisableOfferHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::DisableOffer(params) = &req.params {
+            if params.offer.trim().is_empty() {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "offer is required".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for disable_offer".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let RequestParams::DisableOffer(params) = &req.params {
+            if !offer_store::disable_offer(&params.offer) {
+                return Err(NIP47Error {
+                    code: ErrorCode::NotFound,
+                    message: format!("offer not found: {}", params.offer),
+                });
+            }
+
+            return Ok(Response {
+                result_type: Method::DisableOffer,
+                error: None,
+                result: Some(ResponseResult::DisableOffer(DisableOfferResponse {})),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for disable_offer".to_string(),
+        })
+    }
+}
+
+struct ListAddressesHandler;
+
+impl Handler for ListAddressesHandler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::ListAddresses(_) = &req.params {
+            return Ok(());
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for list_addresses".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        if let RequestParams::ListAddresses(params) = &req.params {
+            let mut addresses: Vec<AddressEntry> = address_store::list_addresses()
+                .iter()
+                .map(|record| {
+                    let total_received: u64 =
+                        record.transactions.iter().map(|tx| tx.amount_sats).sum();
+                    AddressEntry {
+                        address: record.address.clone(),
+                        total_received,
+                    }
+                })
+                .collect();
+
+            // Apply offset/limit
+            let offset = params.offset.unwrap_or(0) as usize;
+            if offset > 0 && offset < addresses.len() {
+                addresses = addresses.split_off(offset);
+            } else if offset >= addresses.len() && offset > 0 {
+                addresses.clear();
+            }
+            if let Some(limit) = params.limit {
+                addresses.truncate(limit as usize);
+            }
+
+            return Ok(Response {
+                result_type: Method::ListAddresses,
+                error: None,
+                result: Some(ResponseResult::ListAddresses(ListAddressesResponse {
+                    addresses,
+                })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for list_addresses".to_string(),
+        })
+    }
+}
+
 struct PayBip321Handler;
 
 impl Handler for PayBip321Handler {
@@ -1824,6 +2138,143 @@ impl Handler for PayBip321Handler {
     }
 }
 
+struct MakeBip321Handler;
+
+impl Handler for MakeBip321Handler {
+    fn validate(&self, req: &Request) -> Result<(), NIP47Error> {
+        if let RequestParams::MakeBip321(_) = &req.params {
+            return Ok(());
+        }
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for make_bip321".to_string(),
+        })
+    }
+
+    fn execute(&self, req: &Request, _caller_pubkey: &str) -> Result<Response, NIP47Error> {
+        let ldk_service = get_ldk_service().ok_or_else(|| NIP47Error {
+            code: ErrorCode::Other,
+            message: "ldk service unavailable".to_string(),
+        })?;
+
+        if let RequestParams::MakeBip321(params) = &req.params {
+            let mut uri: bip321::Uri<'_> = bip321::Uri::new();
+
+            // Set amount (msats → BTC)
+            if let Some(amount_msat) = params.amount {
+                uri.amount = Some(ldk_node::bitcoin::Amount::from_sat(amount_msat / 1000));
+            }
+
+            // Set label and message
+            if let Some(ref label) = params.label {
+                uri.label = Some(bip321::Param::from_decoded(label.to_string()));
+            }
+            if let Some(ref message) = params.message {
+                uri.message = Some(bip321::Param::from_decoded(message.to_string()));
+            }
+
+            // Resolve method list: use params.methods or default to all three
+            let default_methods = vec![
+                Bip321MethodEntry { method: "bolt11".into(), expiry: None, address_type: None },
+                Bip321MethodEntry { method: "bolt12".into(), expiry: None, address_type: None },
+                Bip321MethodEntry { method: "onchain".into(), expiry: None, address_type: None },
+            ];
+            let methods = params.methods.as_deref().unwrap_or(&default_methods);
+
+            let mut generated_any = false;
+
+            for entry in methods {
+                match entry.method.as_str() {
+                    "bolt11" => {
+                        // bolt11 requires an amount
+                        if let Some(amount_msat) = params.amount {
+                            let expiry = entry.expiry;
+                            let desc = params.message.as_deref();
+                            match ldk_service.make_invoice(amount_msat, desc, None, expiry) {
+                                Ok(inv) => {
+                                    uri.lightning.push(bip321::Param::from_decoded(inv.invoice));
+                                    generated_any = true;
+                                }
+                                Err(e) => {
+                                    eprintln!("make_bip321: bolt11 skipped: {e}");
+                                }
+                            }
+                        }
+                    }
+                    "bolt12" => {
+                        let amount = params.amount.unwrap_or(0);
+                        let desc = params.message.as_deref().unwrap_or("bip321 offer");
+                        let expiry = entry.expiry.and_then(|e| u32::try_from(e).ok());
+                        match ldk_service.make_offer(amount, desc, expiry) {
+                            Ok(offer_str) => {
+                                let offer_id = Offer::from_str(&offer_str)
+                                    .map(|o| o.id().0)
+                                    .unwrap_or([0u8; 32]);
+                                offer_store::insert_offer(
+                                    offer_str.clone(),
+                                    desc.to_string(),
+                                    amount,
+                                    offer_id,
+                                );
+                                uri.lno.push(bip321::Param::from_decoded(offer_str));
+                                generated_any = true;
+                            }
+                            Err(e) => {
+                                eprintln!("make_bip321: bolt12 skipped: {e}");
+                            }
+                        }
+                    }
+                    "onchain" => {
+                        // LDK only supports p2tr addresses; reject if caller
+                        // explicitly asks for a different type.
+                        if let Some(ref at) = entry.address_type {
+                            if at != "p2tr" {
+                                eprintln!("make_bip321: onchain skipped: unsupported address_type '{at}'");
+                                continue;
+                            }
+                        }
+                        match ldk_service.new_onchain_address() {
+                            Ok(addr_str) => {
+                                address_store::register_address(addr_str.clone());
+                                if let Ok(parsed) = addr_str.parse() {
+                                    uri.set_address(addr_str, parsed);
+                                    generated_any = true;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("make_bip321: onchain skipped: {e}");
+                            }
+                        }
+                    }
+                    other => {
+                        eprintln!("make_bip321: unsupported method '{other}', skipped");
+                    }
+                }
+            }
+
+            if !generated_any {
+                return Err(NIP47Error {
+                    code: ErrorCode::Other,
+                    message: "failed to generate any payment instruction".to_string(),
+                });
+            }
+
+            return Ok(Response {
+                result_type: Method::MakeBip321,
+                error: None,
+                result: Some(ResponseResult::MakeBip321(MakeBip321Response {
+                    uri: format!("{uri}"),
+                })),
+            });
+        }
+
+        Err(NIP47Error {
+            code: ErrorCode::Other,
+            message: "invalid params for make_bip321".to_string(),
+        })
+    }
+}
+
 struct EstimateOnchainFeesHandler;
 
 impl Handler for EstimateOnchainFeesHandler {
@@ -1929,7 +2380,12 @@ fn request_handlers() -> &'static HashMap<Method, Box<dyn Handler + Send + Sync>
         handlers.insert(Method::PayOffer, Box::new(PayOfferHandler));
         handlers.insert(Method::LookupOffer, Box::new(LookupOfferHandler));
         handlers.insert(Method::LookupAddress, Box::new(LookupAddressHandler));
+        handlers.insert(Method::ListInvoices, Box::new(ListInvoicesHandler));
+        handlers.insert(Method::ListOffers, Box::new(ListOffersHandler));
+        handlers.insert(Method::DisableOffer, Box::new(DisableOfferHandler));
+        handlers.insert(Method::ListAddresses, Box::new(ListAddressesHandler));
         handlers.insert(Method::PayBip321, Box::new(PayBip321Handler));
+        handlers.insert(Method::MakeBip321, Box::new(MakeBip321Handler));
         handlers.insert(
             Method::EstimateOnchainFees,
             Box::new(EstimateOnchainFeesHandler),
@@ -2958,12 +3414,21 @@ async fn handle_ldk_event(
             amount_msat,
             ..
         } => {
-            let notif = build_payment_received_notification(
-                &hex_payment_hash(&payment_hash.0),
-                *amount_msat,
-            );
+            let hex_hash = hex_payment_hash(&payment_hash.0);
+            let notif = build_payment_received_notification(&hex_hash, *amount_msat);
             let json = notif.as_json();
             publish_nwc_notification(client, keys, "payment_received", &json).await?;
+
+            // Record BOLT-12 offer payments
+            if let Ok(details) = ldk_service.lookup_payment_by_hash(&hex_hash) {
+                if details.direction == PaymentDirection::Inbound {
+                    if let PaymentKind::Bolt12Offer { offer_id, .. } = &details.kind {
+                        if let Some(offer_key) = offer_store::find_by_offer_id(&offer_id.0) {
+                            offer_store::record_payment(&offer_key, *amount_msat);
+                        }
+                    }
+                }
+            }
         }
         Event::PaymentSuccessful {
             payment_hash,

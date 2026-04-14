@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "bip321"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "bitcoin",
  "percent-encoding",
@@ -1854,7 +1854,7 @@ checksum = "f0efe882e02d206d8d279c20eb40e03baf7cb5136a1476dc084a324fbc3ec42d"
 [[package]]
 name = "nostr"
 version = "0.44.1"
-source = "git+https://github.com/dukeh3/nostr.git?rev=0e6ede67#0e6ede671417be1556c84fd60fa2301d4f5a74fe"
+source = "git+https://github.com/dukeh3/nostr.git?rev=9ac9adc2#9ac9adc2fbd8cbdb0767d22f26b183d65bba71f4"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -1879,7 +1879,7 @@ dependencies = [
 [[package]]
 name = "nostr-database"
 version = "0.44.0"
-source = "git+https://github.com/dukeh3/nostr.git?rev=0e6ede67#0e6ede671417be1556c84fd60fa2301d4f5a74fe"
+source = "git+https://github.com/dukeh3/nostr.git?rev=9ac9adc2#9ac9adc2fbd8cbdb0767d22f26b183d65bba71f4"
 dependencies = [
  "btreecap",
  "lru",
@@ -1890,7 +1890,7 @@ dependencies = [
 [[package]]
 name = "nostr-gossip"
 version = "0.44.0"
-source = "git+https://github.com/dukeh3/nostr.git?rev=0e6ede67#0e6ede671417be1556c84fd60fa2301d4f5a74fe"
+source = "git+https://github.com/dukeh3/nostr.git?rev=9ac9adc2#9ac9adc2fbd8cbdb0767d22f26b183d65bba71f4"
 dependencies = [
  "nostr",
 ]
@@ -1898,7 +1898,7 @@ dependencies = [
 [[package]]
 name = "nostr-sdk"
 version = "0.44.1"
-source = "git+https://github.com/dukeh3/nostr.git?rev=0e6ede67#0e6ede671417be1556c84fd60fa2301d4f5a74fe"
+source = "git+https://github.com/dukeh3/nostr.git?rev=9ac9adc2#9ac9adc2fbd8cbdb0767d22f26b183d65bba71f4"
 dependencies = [
  "async-utility",
  "async-wsocket",
@@ -2005,7 +2005,7 @@ dependencies = [
 [[package]]
 name = "nwc"
 version = "0.44.0"
-source = "git+https://github.com/dukeh3/nostr.git?rev=0e6ede67#0e6ede671417be1556c84fd60fa2301d4f5a74fe"
+source = "git+https://github.com/dukeh3/nostr.git?rev=9ac9adc2#9ac9adc2fbd8cbdb0767d22f26b183d65bba71f4"
 dependencies = [
  "nostr",
  "nostr-sdk",

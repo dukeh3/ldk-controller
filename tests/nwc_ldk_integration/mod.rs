@@ -9,6 +9,7 @@ mod pay_invoice_invalid_invoice_returns_error;
 mod pay_invoice_zero_amount_returns_error;
 mod pay_keysend_invalid_pubkey_returns_error;
 mod pay_keysend_zero_amount_returns_error;
+mod list_invoices_after_payment;
 
 use nostr_sdk::prelude::{Keys, PublicKey};
 use std::sync::OnceLock;
