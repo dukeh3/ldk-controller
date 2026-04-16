@@ -1,0 +1,48 @@
+ldk-controller (0.7.0-1) unstable; urgency=medium
+
+  * Pin ICU4X crates to 2.1.x for Rust 1.85 compat (trixie)
+  * Bump nostr-sdk for WebSocket PING/PONG keepalive fix
+  * Add tracing-subscriber for runtime observability (RUST_LOG)
+  * Fix stale NWC request processing on startup (since=now filter)
+  * Implement d-lf fork improvements (#99 items 1-5, 13)
+  * Move fee estimation from NNC to NWC
+  * Add NWC compliance: list_invoices, list_offers, list_addresses, disable_offer
+  * Remove _msat suffix from NNC fields (align with NIP-47 convention)
+
+ -- René Malmgren <rene@flowrate.dev>  Thu, 17 Apr 2026 00:19:00 +0400
+
+ldk-controller (0.6.1-1) unstable; urgency=medium
+
+  * Fix stale NWC request processing on startup (since=now filter)
+
+ -- René Malmgren <rene@flowrate.dev>  Wed, 09 Apr 2026 15:00:00 +0000
+
+ldk-controller (0.6.0-1) unstable; urgency=medium
+
+  * Add tracing-subscriber for runtime observability (RUST_LOG)
+  * Reduce grant polling interval from 1s to 30s
+
+ -- René Malmgren <rene@flowrate.dev>  Wed, 09 Apr 2026 14:10:00 +0000
+
+ldk-controller (0.5.1-1) unstable; urgency=medium
+
+  * Fix WebSocket PING/PONG keepalive (nostr-sdk rev 4e20d22b)
+  * Relay connections no longer drop after idle periods
+
+ -- René Malmgren <rene@flowrate.dev>  Wed, 09 Apr 2026 09:40:00 +0000
+
+ldk-controller (0.5.0-1) unstable; urgency=medium
+
+  * NIP-47/NIP-XX compliance (Phases 1-6)
+  * PaymentMethod enum, balance split, payment_method fields
+  * NIP-44 encryption, notification infrastructure
+  * Advanced NNC control methods
+  * Phase 6 field integration tests
+
+ -- René Malmgren <rene@flowrate.dev>  Mon, 07 Apr 2026 20:00:00 +0000
+
+ldk-controller (0.0.1-1) unstable; urgency=medium
+
+  * Initial Debian packaging skeleton.
+
+ -- René Malmgren <rene@flowrate.dev>  Sun, 22 Feb 2026 21:30:00 +0000
