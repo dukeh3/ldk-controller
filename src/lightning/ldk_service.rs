@@ -198,10 +198,10 @@ pub struct LdkChannelFees {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub short_channel_id: Option<String>,
     pub peer_pubkey: String,
-    pub base_fee_msat: u32,
+    pub base_fee: u32,
     pub fee_rate: u32,
-    pub min_htlc_msat: u64,
-    pub max_htlc_msat: Option<u64>,
+    pub min_htlc: u64,
+    pub max_htlc: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -217,10 +217,10 @@ pub struct NetworkNodeInfo {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NetworkChannelPolicy {
-    pub base_fee_msat: u32,
+    pub base_fee: u32,
     pub fee_rate: u32,
-    pub min_htlc_msat: u64,
-    pub max_htlc_msat: u64,
+    pub min_htlc: u64,
+    pub max_htlc: u64,
     pub time_lock_delta: u16,
     pub disabled: bool,
     pub last_update: u32,
@@ -625,10 +625,10 @@ impl LdkService {
                     id: channel.channel_id.to_string(),
                     short_channel_id,
                     peer_pubkey: channel.counterparty_node_id.to_string(),
-                    base_fee_msat: channel.config.forwarding_fee_base_msat,
+                    base_fee: channel.config.forwarding_fee_base_msat,
                     fee_rate: channel.config.forwarding_fee_proportional_millionths,
-                    min_htlc_msat: channel.inbound_htlc_minimum_msat,
-                    max_htlc_msat: channel.inbound_htlc_maximum_msat,
+                    min_htlc: channel.inbound_htlc_minimum_msat,
+                    max_htlc: channel.inbound_htlc_maximum_msat,
                 }
             })
             .collect()
@@ -725,19 +725,19 @@ impl LdkService {
         let graph = self.node.network_graph();
         Ok(graph.channel(scid).map(|ch| {
             let node1_policy = ch.one_to_two.as_ref().map(|p| NetworkChannelPolicy {
-                base_fee_msat: p.fees.base_msat,
+                base_fee: p.fees.base_msat,
                 fee_rate: p.fees.proportional_millionths,
-                min_htlc_msat: p.htlc_minimum_msat,
-                max_htlc_msat: p.htlc_maximum_msat,
+                min_htlc: p.htlc_minimum_msat,
+                max_htlc: p.htlc_maximum_msat,
                 time_lock_delta: p.cltv_expiry_delta,
                 disabled: !p.enabled,
                 last_update: p.last_update,
             });
             let node2_policy = ch.two_to_one.as_ref().map(|p| NetworkChannelPolicy {
-                base_fee_msat: p.fees.base_msat,
+                base_fee: p.fees.base_msat,
                 fee_rate: p.fees.proportional_millionths,
-                min_htlc_msat: p.htlc_minimum_msat,
-                max_htlc_msat: p.htlc_maximum_msat,
+                min_htlc: p.htlc_minimum_msat,
+                max_htlc: p.htlc_maximum_msat,
                 time_lock_delta: p.cltv_expiry_delta,
                 disabled: !p.enabled,
                 last_update: p.last_update,

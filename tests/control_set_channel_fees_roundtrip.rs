@@ -80,7 +80,7 @@ async fn control_set_channel_fees_requires_ldk() -> Result<()> {
         "method": "set_channel_fees",
         "params": {
             "id": "0000000000000000000000000000000000000000000000000000000000000000",
-            "base_fee_msat": 1000,
+            "base_fee": 1000,
             "fee_rate": 100
         }
     });

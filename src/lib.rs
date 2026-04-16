@@ -2925,7 +2925,8 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         struct SetChannelFeesParams {
             id: String,
             #[serde(default)]
-            base_fee_msat: Option<u32>,
+            #[serde(alias = "base_fee_msat")]
+            base_fee: Option<u32>,
             #[serde(default)]
             fee_rate: Option<u32>,
         }
@@ -2954,7 +2955,7 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         };
         if let Err(e) = ldk_service.set_channel_fees(
             &params.id,
-            params.base_fee_msat,
+            params.base_fee,
             params.fee_rate,
         ) {
             return ControlResponse {
