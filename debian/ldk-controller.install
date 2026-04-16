@@ -1,3 +1,0 @@
-target/release/ldk-controller usr/bin/
-debian/config.toml etc/ldk-controller/
-debian/ldk-controller.sysusers usr/lib/sysusers.d/
