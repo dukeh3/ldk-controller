@@ -62,7 +62,7 @@ async fn test_nwc_pay_onchain_roundtrip() -> Result<()> {
 
     let params = PayOnchainRequest {
         address: "bcrt1qtest123".to_string(),
-        amount: 50_000,
+        amount_sats: 50_000,
         feerate: None,
     };
     let request_event = Request::pay_onchain(params)

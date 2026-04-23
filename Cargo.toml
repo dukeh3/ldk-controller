@@ -7,8 +7,8 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-nostr-sdk = { git = "https://github.com/dukeh3/nostr.git", rev = "9ac9adc2" }
-nwc = { git = "https://github.com/dukeh3/nostr.git", rev = "9ac9adc2" }
+nostr-sdk = { git = "https://github.com/dukeh3/nostr.git", rev = "247df9c1" }
+nwc = { git = "https://github.com/dukeh3/nostr.git", rev = "247df9c1" }
 bip321 = { git = "https://github.com/DarkWebDivingClub/bip321.git", rev = "fcd4864" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
