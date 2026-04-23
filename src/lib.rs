@@ -520,7 +520,7 @@ fn request_spend_msat(request: &Request) -> Option<u64> {
     match &request.params {
         RequestParams::PayInvoice(params) => params.amount,
         RequestParams::PayKeysend(params) => Some(params.amount),
-        RequestParams::PayOnchain(params) => Some(params.amount.saturating_mul(1000)),
+        RequestParams::PayOnchain(params) => Some(params.amount_sats.saturating_mul(1000)),
         RequestParams::PayOffer(params) => params.amount,
         RequestParams::PayBip321(params) => {
             bip321::Uri::parse(&params.uri)
@@ -1045,7 +1045,8 @@ impl Handler for GetBalanceHandler {
             result: Some(ResponseResult::GetBalance(GetBalanceResponse {
                 balance: bal.total_msat,
                 lightning_balance: Some(bal.lightning_msat),
-                onchain_balance: Some(bal.onchain_msat),
+                // On-chain UTXO sum is sat-precise; divide by 1000 to match spec _sats convention.
+                onchain_balance_sats: Some(bal.onchain_msat / 1000),
             })),
         })
     }
@@ -1514,10 +1515,10 @@ impl Handler for PayOnchainHandler {
                     message: "address is required".to_string(),
                 });
             }
-            if params.amount == 0 {
+            if params.amount_sats == 0 {
                 return Err(NIP47Error {
                     code: ErrorCode::Other,
-                    message: "amount must be greater than 0".to_string(),
+                    message: "amount_sats must be greater than 0".to_string(),
                 });
             }
             return Ok(());
@@ -1537,7 +1538,7 @@ impl Handler for PayOnchainHandler {
 
         if let RequestParams::PayOnchain(params) = &req.params {
             let txid = ldk_service
-                .pay_onchain(&params.address, params.amount, params.feerate)
+                .pay_onchain(&params.address, params.amount_sats, params.feerate)
                 .map_err(|e| map_ldk_service_error("pay_onchain", ErrorCode::PaymentFailed, e))?;
 
             return Ok(Response {
@@ -1743,19 +1744,19 @@ impl Handler for LookupAddressHandler {
                 .iter()
                 .map(|tx| AddressTransaction {
                     txid: tx.txid.clone(),
-                    amount: tx.amount_sats,
+                    amount_sats: tx.amount_sats,
                     timestamp: Timestamp::from(tx.timestamp),
                 })
                 .collect();
 
-            let total_received: u64 = record.transactions.iter().map(|tx| tx.amount_sats).sum();
+            let total_received_sats: u64 = record.transactions.iter().map(|tx| tx.amount_sats).sum();
 
             return Ok(Response {
                 result_type: Method::LookupAddress,
                 error: None,
                 result: Some(ResponseResult::LookupAddress(LookupAddressResponse {
                     address: record.address,
-                    total_received,
+                    total_received_sats,
                     transactions,
                 })),
             });
@@ -1994,11 +1995,11 @@ impl Handler for ListAddressesHandler {
             let mut addresses: Vec<AddressEntry> = address_store::list_addresses()
                 .iter()
                 .map(|record| {
-                    let total_received: u64 =
+                    let total_received_sats: u64 =
                         record.transactions.iter().map(|tx| tx.amount_sats).sum();
                     AddressEntry {
                         address: record.address.clone(),
-                        total_received,
+                        total_received_sats,
                     }
                 })
                 .collect();

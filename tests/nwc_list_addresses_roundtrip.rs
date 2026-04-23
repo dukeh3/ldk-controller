@@ -107,7 +107,7 @@ async fn test_nwc_list_addresses_returns_seeded_addresses() -> Result<()> {
                         .find(|a| a.address == "bcrt1qaddr_one")
                         .expect("addr_one not found");
                     assert_eq!(
-                        addr_one.total_received, 80_000,
+                        addr_one.total_received_sats, 80_000,
                         "addr_one should have 50k + 30k = 80k sats"
                     );
 
@@ -117,7 +117,7 @@ async fn test_nwc_list_addresses_returns_seeded_addresses() -> Result<()> {
                         .find(|a| a.address == "bcrt1qaddr_two")
                         .expect("addr_two not found");
                     assert_eq!(
-                        addr_two.total_received, 100_000,
+                        addr_two.total_received_sats, 100_000,
                         "addr_two should have 100k sats"
                     );
 
