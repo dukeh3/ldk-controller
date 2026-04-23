@@ -654,7 +654,9 @@ struct OpenChannelParams {
     pubkey: String,
     #[serde(default)]
     host: Option<String>,
-    amount: u64,
+    /// Channel capacity in sats (NIP-XX `_sats` rule — on-chain funding output).
+    amount_sats: u64,
+    /// Amount to push to peer, in msats (NIP-XX — Lightning channel state).
     #[serde(default)]
     push_amount: Option<u64>,
     #[serde(default)]
@@ -2673,13 +2675,13 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
                 };
             }
         };
-        if params.amount == 0 {
+        if params.amount_sats == 0 {
             return ControlResponse {
                 result_type: "open_channel".to_string(),
                 result: None,
                 error: Some(control_error(
                     "OTHER",
-                    "amount must be greater than 0".to_string(),
+                    "amount_sats must be greater than 0".to_string(),
                 )),
             };
         }
@@ -2694,7 +2696,9 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
             };
         };
 
-        let push_msat = params.push_amount.map(|sats| sats * 1000);
+        // Per NIP-XX (post units patch): push_amount is already msats on the wire.
+        // No unit conversion needed before calling ldk-node.
+        let push_msat = params.push_amount;
         let address = if let Some(ref host) = params.host {
             host.clone()
         } else {
@@ -2720,7 +2724,7 @@ fn process_control_request(request: ControlRequest, caller_pubkey: &str) -> Cont
         if let Err(e) = ldk_service.open_channel(
             &params.pubkey,
             &address,
-            params.amount,
+            params.amount_sats,
             push_msat,
         ) {
             return ControlResponse {

@@ -1085,8 +1085,8 @@ async fn e2e_control_alice_opens_channel_and_bidirectional_payment() -> Result<(
             "params": {
                 "pubkey": bob.node_id(),
                 "host": format!("127.0.0.1:{bob_listen_port}"),
-                "amount": 2_000_000,
-                "push_amount": 1_000_000u64
+                "amount_sats": 2_000_000,
+                "push_amount": 1_000_000_000u64
             }
         }),
     )
