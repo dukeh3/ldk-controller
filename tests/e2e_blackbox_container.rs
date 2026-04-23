@@ -49,6 +49,10 @@ fn ensure_image_built() {
         let build = Command::new("docker")
             .args([
                 "build",
+                // Use host networking for the build so apt/cargo deps resolve
+                // reliably on environments where BuildKit's default bridge
+                // returns IPv6 addresses that don't route out.
+                "--network=host",
                 "--build-context",
                 "bip321=../bip321",
                 "-f",
