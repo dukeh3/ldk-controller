@@ -261,6 +261,14 @@ pub struct FoundRoute {
 }
 
 impl LdkService {
+    /// Create an LdkService from an already-started Node.
+    pub fn from_node(node: Node, network: Network) -> Arc<Self> {
+        Arc::new(Self {
+            node: Arc::new(node),
+            network,
+        })
+    }
+
     pub fn start_from_config(cfg: &LdkServiceConfig) -> Result<Arc<Self>, LdkServiceInitError> {
         cfg.validate()?;
         let network = cfg.parse_network()?;
