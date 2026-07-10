@@ -25,6 +25,14 @@ pub struct LdkServiceConfig {
     pub ldk_storage_dir: String,
     pub ldk_listen_addr: Option<String>,
     pub node_alias: Option<String>,
+    /// Signer transport type: "nostr" or "embedded" (default).
+    pub signer_transport: String,
+    /// Nostr relay URL (required when signer_transport = "nostr").
+    pub signer_relay: Option<String>,
+    /// Node-proxy's Nostr secret key in hex (required when signer_transport = "nostr").
+    pub signer_nsec: Option<String>,
+    /// Remote signer's Nostr public key in hex (required when signer_transport = "nostr").
+    pub signer_pubkey: Option<String>,
 }
 
 impl LdkServiceConfig {
@@ -151,6 +159,8 @@ pub struct LdkNodeStatus {
 pub struct LdkService {
     node: Arc<Node>,
     network: Network,
+    /// VLS keys manager, if using VLS signer.
+    keys_manager: Option<Arc<ldk_vls2_client::KeysManagerClient>>,
 }
 
 pub struct LdkPaymentResult {
@@ -266,12 +276,64 @@ impl LdkService {
         Arc::new(Self {
             node: Arc::new(node),
             network,
+            keys_manager: None,
         })
     }
 
     pub fn start_from_config(cfg: &LdkServiceConfig) -> Result<Arc<Self>, LdkServiceInitError> {
         cfg.validate()?;
         let network = cfg.parse_network()?;
+
+        // Convert ldk-node Network to VLS Network for the embedded signer
+        let vls_network = match network {
+            Network::Regtest => lightning_signer::bitcoin::Network::Regtest,
+            Network::Testnet => lightning_signer::bitcoin::Network::Testnet,
+            Network::Bitcoin => lightning_signer::bitcoin::Network::Bitcoin,
+            Network::Signet => lightning_signer::bitcoin::Network::Signet,
+            _ => return Err(LdkServiceInitError::InvalidNetwork { network: cfg.network.clone() }),
+        };
+
+        // Create transport: either Nostr (remote signer) or embedded (in-process)
+        let transport: Arc<dyn ldk_vls2_client::Transport> = match cfg.signer_transport.as_str() {
+            "nostr" => {
+                let relay = cfg.signer_relay.as_deref().ok_or_else(|| {
+                    LdkServiceInitError::InvalidConfig("signer.relay required for nostr transport".into())
+                })?;
+                let nsec = cfg.signer_nsec.as_deref().ok_or_else(|| {
+                    LdkServiceInitError::InvalidConfig("signer.nsec required for nostr transport".into())
+                })?;
+                let signer_pubkey = cfg.signer_pubkey.as_deref().ok_or_else(|| {
+                    LdkServiceInitError::InvalidConfig("signer.signer_pubkey required for nostr transport".into())
+                })?;
+                eprintln!("Using Nostr signer transport: relay={}", relay);
+                Arc::new(
+                    ldk_vls2_client::NostrTransport::new(relay, nsec, signer_pubkey)
+                        .map_err(|e| LdkServiceInitError::BuildFailed(format!("NostrTransport init: {}", e)))?,
+                )
+            }
+            _ => {
+                // Default: embedded signer with NullTransport
+                let policy_filters = vec![
+                    "policy-commitment-htlc-routing-balance:warn".to_string(),
+                    "policy-routing-balanced:warn".to_string(),
+                ];
+                let signer = ldk_vls2_signer::EmbeddedSigner::new_with_protocol_version(
+                    vls_network,
+                    None,  // DummyPersister for now
+                    false,
+                    &policy_filters,
+                    6,  // PROTOCOL_VERSION_NO_SECRET: enables explicit RevokeCommitmentTx
+                ).map_err(|e| LdkServiceInitError::BuildFailed(format!("VLS signer init: {}", e)))?;
+                eprintln!("Using embedded signer transport");
+                Arc::new(ldk_vls2_client::NullTransport::new(signer))
+            }
+        };
+
+        let network_name = cfg.network.to_lowercase();
+        let keys_manager = Arc::new(ldk_vls2_client::KeysManagerClient::new(
+            transport,
+            &network_name,
+        ));
 
         let mut builder = Builder::new();
         builder.set_network(network);
@@ -282,6 +344,17 @@ impl LdkService {
             cfg.bitcoind_rpc_password.clone(),
         );
         builder.set_storage_dir_path(cfg.ldk_storage_dir.clone());
+
+        // Inject VLS signer via bridge wrapper
+        let bridge = Arc::new(vls_keys_bridge::VlsKeysInterface {
+            inner: keys_manager.clone(),
+        });
+        builder.set_custom_keys_interface(bridge);
+
+        // Configure watch-only BDK wallet with VLS signing
+        let xpub = keys_manager.xpub();
+        let bdk_signer = Arc::new(keys_manager.bdk_signer());
+        builder.set_custom_wallet(xpub, bdk_signer);
 
         if let Some(listen_addr) = &cfg.ldk_listen_addr {
             let socket = SocketAddress::from_str(listen_addr).map_err(|_| {
@@ -309,7 +382,19 @@ impl LdkService {
         Ok(Arc::new(Self {
             node: Arc::new(node),
             network,
+            keys_manager: Some(keys_manager),
         }))
+    }
+
+    /// Notify the VLS signer that a channel is ready (CheckOutpoint + LockOutpoint).
+    ///
+    /// Call this from the Event::ChannelReady handler.
+    pub fn notify_channel_ready(&self, user_channel_id: u128) {
+        if let Some(km) = &self.keys_manager {
+            if let Err(e) = km.channel_ready_by_user_channel_id(user_channel_id) {
+                eprintln!("WARN: VLS channel_ready failed: {}", e);
+            }
+        }
     }
 
     pub fn node(&self) -> &Arc<Node> {
@@ -1134,4 +1219,158 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
         .collect()
+}
+
+/// Wrapper around KeysManagerClient that implements ldk_node::KeysInterface.
+///
+/// This is needed because ldk_vls2_client defines its own KeysInterface mirror
+/// to avoid a circular dependency on ldk-node, but ldk-node's Builder requires
+/// the ldk_node::KeysInterface trait specifically.
+mod vls_keys_bridge {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use ldk_node::bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
+    use ldk_node::bitcoin::secp256k1::ecdh::SharedSecret;
+    use ldk_node::bitcoin::secp256k1::{All, PublicKey, Scalar, Secp256k1};
+    use ldk_node::bitcoin::{ScriptBuf, Transaction, TxOut};
+    use ldk_node::lightning::ln::inbound_payment::ExpandedKey;
+    use ldk_node::lightning::ln::msgs::UnsignedGossipMessage;
+    use ldk_node::lightning::ln::script::ShutdownScript;
+    use ldk_node::lightning::sign::{
+        ChangeDestinationSource, EntropySource, NodeSigner, OutputSpender,
+        PeerStorageKey, ReceiveAuthKey, Recipient, SignerProvider, SpendableOutputDescriptor,
+    };
+    use ldk_node::lightning::util::dyn_signer::DynSigner;
+    use ldk_node::lightning_invoice::RawBolt11Invoice;
+
+    use ldk_vls2_client::KeysManagerClient;
+
+    /// Newtype that bridges ldk_vls2_client::KeysInterface → ldk_node::KeysInterface.
+    pub struct VlsKeysInterface {
+        pub inner: Arc<KeysManagerClient>,
+    }
+
+    impl EntropySource for VlsKeysInterface {
+        fn get_secure_random_bytes(&self) -> [u8; 32] {
+            self.inner.get_secure_random_bytes()
+        }
+    }
+
+    impl NodeSigner for VlsKeysInterface {
+        fn get_expanded_key(&self) -> ExpandedKey {
+            self.inner.get_expanded_key()
+        }
+
+        fn get_peer_storage_key(&self) -> PeerStorageKey {
+            self.inner.get_peer_storage_key()
+        }
+
+        fn get_receive_auth_key(&self) -> ReceiveAuthKey {
+            self.inner.get_receive_auth_key()
+        }
+
+        fn get_node_id(&self, recipient: Recipient) -> Result<PublicKey, ()> {
+            self.inner.get_node_id(recipient)
+        }
+
+        fn ecdh(
+            &self,
+            recipient: Recipient,
+            other_key: &PublicKey,
+            tweak: Option<&Scalar>,
+        ) -> Result<SharedSecret, ()> {
+            self.inner.ecdh(recipient, other_key, tweak)
+        }
+
+        fn sign_invoice(
+            &self,
+            invoice: &RawBolt11Invoice,
+            recipient: Recipient,
+        ) -> Result<RecoverableSignature, ()> {
+            self.inner.sign_invoice(invoice, recipient)
+        }
+
+        fn sign_bolt12_invoice(
+            &self,
+            invoice: &ldk_node::lightning::offers::invoice::UnsignedBolt12Invoice,
+        ) -> Result<ldk_node::bitcoin::secp256k1::schnorr::Signature, ()> {
+            self.inner.sign_bolt12_invoice(invoice)
+        }
+
+        fn sign_gossip_message(&self, msg: UnsignedGossipMessage) -> Result<Signature, ()> {
+            self.inner.sign_gossip_message(msg)
+        }
+
+        fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
+            self.inner.sign_message(msg)
+        }
+    }
+
+    impl SignerProvider for VlsKeysInterface {
+        type EcdsaSigner = DynSigner;
+
+        fn generate_channel_keys_id(
+            &self,
+            inbound: bool,
+            user_channel_id: u128,
+        ) -> [u8; 32] {
+            self.inner.generate_channel_keys_id(inbound, user_channel_id)
+        }
+
+        fn derive_channel_signer(
+            &self,
+            channel_keys_id: [u8; 32],
+        ) -> Self::EcdsaSigner {
+            self.inner.derive_channel_signer(channel_keys_id)
+        }
+
+        fn get_destination_script(&self, channel_keys_id: [u8; 32]) -> Result<ScriptBuf, ()> {
+            self.inner.get_destination_script(channel_keys_id)
+        }
+
+        fn get_shutdown_scriptpubkey(&self) -> Result<ShutdownScript, ()> {
+            self.inner.get_shutdown_scriptpubkey()
+        }
+    }
+
+    impl OutputSpender for VlsKeysInterface {
+        fn spend_spendable_outputs(
+            &self,
+            descriptors: &[&SpendableOutputDescriptor],
+            outputs: Vec<TxOut>,
+            change_destination_script: ScriptBuf,
+            feerate_sat_per_1000_weight: u32,
+            locktime: Option<ldk_node::bitcoin::absolute::LockTime>,
+            secp_ctx: &Secp256k1<All>,
+        ) -> Result<Transaction, ()> {
+            self.inner.spend_spendable_outputs(
+                descriptors,
+                outputs,
+                change_destination_script,
+                feerate_sat_per_1000_weight,
+                locktime,
+                secp_ctx,
+            )
+        }
+    }
+
+    impl ChangeDestinationSource for VlsKeysInterface {
+        fn get_change_destination_script<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<ScriptBuf, ()>> + Send + 'a>> {
+            self.inner.get_change_destination_script()
+        }
+    }
+
+    impl ldk_node::KeysInterface for VlsKeysInterface {
+        fn sign_invoice_hash(
+            &self,
+            hash: &ldk_node::bitcoin::secp256k1::Message,
+        ) -> Result<RecoverableSignature, ()> {
+            // Delegate to the ldk_vls2_client KeysInterface impl
+            ldk_vls2_client::KeysInterface::sign_invoice_hash(&*self.inner, hash)
+        }
+    }
 }

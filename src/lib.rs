@@ -3459,10 +3459,14 @@ async fn handle_ldk_event(
         }
         Event::ChannelReady {
             channel_id,
+            user_channel_id,
             counterparty_node_id,
             funding_txo,
             ..
         } => {
+            // Notify VLS signer that the channel is ready (CheckOutpoint + LockOutpoint)
+            ldk_service.notify_channel_ready(user_channel_id.0);
+
             let notif = build_channel_opened_notification(
                 ldk_service,
                 &channel_id.to_string(),

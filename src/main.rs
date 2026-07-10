@@ -11,6 +11,7 @@ struct Config {
     nostr: NostrConfig,
     wallet: WalletConfig,
     bitcoind: Option<BitcoindConfig>,
+    signer: Option<SignerConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +42,14 @@ struct BitcoindConfig {
     rpc_port: u16,
     rpc_user: String,
     rpc_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignerConfig {
+    transport: String,
+    relay: Option<String>,
+    nsec: Option<String>,
+    signer_pubkey: Option<String>,
 }
 
 #[tokio::main]
@@ -85,6 +94,24 @@ async fn main() -> Result<()> {
     // Start NWC service; if bitcoind config is present, attach an LDK backend.
     let _ldk_service: Option<Arc<LdkService>>;
     let client = if let Some(bitcoind) = &config.bitcoind {
+        let signer_transport = config
+            .signer
+            .as_ref()
+            .map(|s| s.transport.as_str())
+            .unwrap_or("embedded");
+        let signer_relay = config
+            .signer
+            .as_ref()
+            .and_then(|s| s.relay.clone());
+        let signer_nsec = config
+            .signer
+            .as_ref()
+            .and_then(|s| s.nsec.clone());
+        let signer_pubkey = config
+            .signer
+            .as_ref()
+            .and_then(|s| s.signer_pubkey.clone());
+
         let ldk_cfg = LdkServiceConfig {
             network: config.node.network.clone(),
             bitcoind_rpc_host: bitcoind.rpc_host.clone(),
@@ -94,6 +121,10 @@ async fn main() -> Result<()> {
             ldk_storage_dir: config.node.data_dir.clone(),
             ldk_listen_addr: Some(format!("0.0.0.0:{}", config.node.listening_port)),
             node_alias: config.node.alias.clone(),
+            signer_transport: signer_transport.to_string(),
+            signer_relay,
+            signer_nsec,
+            signer_pubkey,
         };
         let ldk_service =
             LdkService::start_from_config(&ldk_cfg).expect("Failed to start LDK service");

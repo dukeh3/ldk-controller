@@ -13,6 +13,9 @@ bip321 = { git = "https://github.com/DarkWebDivingClub/bip321.git", rev = "fcd48
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ldk-node = { path = "/home/rene/git/vls/ldk-node" }
+ldk-vls2-client = { path = "/home/rene/git/vls/vls-nostr-transport/ldk-vls2-client", features = ["nostr_transport"] }
+ldk-vls2-signer = { path = "/home/rene/git/vls/vls-nostr-transport/ldk-vls2-signer" }
+lightning-signer = { path = "/home/rene/git/vls/validating-lightning-signer/vls-core", package = "vls-core" }
 
 [dev-dependencies]
 testcontainers = "0.27"
