@@ -32,6 +32,10 @@ async fn start_sync_balance() {
         ldk_storage_dir: unique_storage_dir("ldk-service-sync-balance"),
         ldk_listen_addr: None,
         node_alias: None,
+        signer_transport: "embedded".to_string(),
+        signer_relay: None,
+        signer_nsec: None,
+        signer_pubkey: None,
     };
 
     let service = LdkService::start_from_config(&cfg).expect("LdkService should start");

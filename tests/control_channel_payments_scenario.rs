@@ -104,6 +104,10 @@ async fn alice_opens_channel_then_both_directions_pay() -> Result<()> {
         ldk_storage_dir: unique_storage_dir("scenario-alice"),
         ldk_listen_addr: Some(format!("127.0.0.1:{port_a}")),
         node_alias: None,
+        signer_transport: "embedded".to_string(),
+        signer_relay: None,
+        signer_nsec: None,
+        signer_pubkey: None,
     };
     let alice = LdkService::start_from_config(&alice_cfg).expect("start alice");
 

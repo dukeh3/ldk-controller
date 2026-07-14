@@ -71,6 +71,10 @@ async fn pay_invoice_invalid_invoice_returns_error() -> Result<()> {
         ldk_storage_dir: unique_storage_dir("nwc-ldk-pay-invoice-invalid"),
         ldk_listen_addr: None,
         node_alias: None,
+        signer_transport: "embedded".to_string(),
+        signer_relay: None,
+        signer_nsec: None,
+        signer_pubkey: None,
     };
     let ldk_service = LdkService::start_from_config(&ldk_cfg).expect("ldk service should start");
 

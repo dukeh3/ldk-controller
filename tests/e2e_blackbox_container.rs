@@ -46,11 +46,20 @@ fn unique_id(prefix: &str) -> String {
 fn ensure_image_built() {
     static IMAGE_BUILT: OnceLock<()> = OnceLock::new();
     IMAGE_BUILT.get_or_init(|| {
+        // Build the ldk-controller binary on the host first.
+        let cargo_build = Command::new("cargo")
+            .args(["build", "--bin", "ldk-controller"])
+            .output()
+            .expect("failed to run cargo build for ldk-controller");
+        if !cargo_build.status.success() {
+            let stderr = String::from_utf8_lossy(&cargo_build.stderr);
+            panic!("cargo build ldk-controller failed: {stderr}");
+        }
+
+        // Build a slim Docker image with the pre-built binary.
         let build = Command::new("docker")
             .args([
                 "build",
-                "--build-context",
-                "bip321=../bip321",
                 "-f",
                 "tests/e2e/docker/ldk-controller/Dockerfile",
                 "-t",
@@ -748,6 +757,10 @@ async fn e2e_control_open_channel_and_bidirectional_payment() -> Result<()> {
         ldk_storage_dir: format!("/tmp/{}", unique_id("e2e-bob-ldk")),
         ldk_listen_addr: Some(format!("127.0.0.1:{bob_listen_port}")),
         node_alias: None,
+        signer_transport: "embedded".to_string(),
+        signer_relay: None,
+        signer_nsec: None,
+        signer_pubkey: None,
     };
     let bob = LdkService::start_from_config(&bob_cfg).expect("start bob ldk");
 
@@ -944,6 +957,10 @@ async fn e2e_control_alice_opens_channel_and_bidirectional_payment() -> Result<(
         ldk_storage_dir: format!("/tmp/{}", unique_id("e2e-bob-ldk-alice-opens")),
         ldk_listen_addr: Some(format!("0.0.0.0:{bob_listen_port}")),
         node_alias: None,
+        signer_transport: "embedded".to_string(),
+        signer_relay: None,
+        signer_nsec: None,
+        signer_pubkey: None,
     };
     let bob = LdkService::start_from_config(&bob_cfg).expect("start bob ldk");
 

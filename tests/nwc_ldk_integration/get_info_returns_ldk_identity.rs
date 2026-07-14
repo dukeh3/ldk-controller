@@ -70,6 +70,10 @@ async fn get_info_returns_ldk_identity() -> Result<()> {
         ldk_storage_dir: unique_storage_dir("nwc-ldk-get-info"),
         ldk_listen_addr: None,
         node_alias: None,
+        signer_transport: "embedded".to_string(),
+        signer_relay: None,
+        signer_nsec: None,
+        signer_pubkey: None,
     };
     let ldk_service = LdkService::start_from_config(&ldk_cfg).expect("ldk service should start");
     let expected_ldk_pubkey = ldk_service.node_id();

@@ -71,6 +71,10 @@ async fn make_invoice_happy_path() -> Result<()> {
         ldk_storage_dir: unique_storage_dir("nwc-ldk-make-invoice"),
         ldk_listen_addr: None,
         node_alias: None,
+        signer_transport: "embedded".to_string(),
+        signer_relay: None,
+        signer_nsec: None,
+        signer_pubkey: None,
     };
     let ldk_service = LdkService::start_from_config(&ldk_cfg).expect("ldk service should start");
 

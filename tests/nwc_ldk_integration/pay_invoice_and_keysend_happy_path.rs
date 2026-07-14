@@ -112,6 +112,10 @@ async fn pay_invoice_and_keysend_happy_path() -> Result<()> {
         ldk_storage_dir: unique_storage_dir("nwc-ldk-payer"),
         ldk_listen_addr: Some(payer_addr.clone()),
         node_alias: None,
+        signer_transport: "embedded".to_string(),
+        signer_relay: None,
+        signer_nsec: None,
+        signer_pubkey: None,
     };
     let ldk_service = LdkService::start_from_config(&payer_cfg).expect("payer ldk service starts");
 
